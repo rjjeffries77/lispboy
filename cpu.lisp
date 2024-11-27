@@ -1,35 +1,32 @@
 (in-package :lispboy)
 
 (defmacro defcpu (name (&rest registers))
-  '(defstruct ,name
+  `(defstruct ,name
      ,@(loop for reg in registers 
            collect `(,reg 0 :type (unsigned-byte 8)))
-           (PC 0: type (unsigned-byte 16)
-           (SP 0: type (unsigned-byte 16)))))
+           (PC 0 :type (unsigned-byte 16))
+           (SP 0 :type (unsigned-byte 16))))
 
 (defcpu cpu (A B C D E H L))
 
-(defun execute-opcode (cpu opcode)
-  (match opcode
-    (#x00 nil) ; NOP
-    (#x3E (let ((value (read-byte-at-pc cpu)))  ; LD A,n
-           (setf (cpu-a cpu) value)
-           (incf (cpu-pc cpu))))
-    (#x47 (setf (cpu-b cpu) (cpu-a cpu)))       ; LD B,A
-    ;; Add more opcodes as needed
-    (t (error "Unknown opcode: ~X" opcode))))
+(defvar gameboy-cpu (make-cpu))
 
-;; Helper functions
-(defun read-byte-at-pc (cpu)
-  (incf (cpu-PC cpu))
-  (aref *memory* (1- (cpu-pc cpu))))
+;; reads the byte at the PC, adjusts the PC after 
+(defun read-byte-at-pc (cpu mmu)
+  (let ((byte (read-byte-mm mmu (cpu-PC cpu))))
+    (incf (cpu-pc cpu))
+    byte))
 
-(defun read-word-at-pc (cpu)
-  (let ((low-byte (read-byte-at-pc cpu))
-        (high-byte (read-byte-at-pc cpu)))
-    (+ low-byte (ash high-byte 8))))
+;; reads the word at the PC, adjusting the PC
+(defun read-word-at-pc (cpu mmu)
+  (let ((low-byte (read-byte-at-pc cpu mmu))
+        (high-byte (read-byte-at-pc cpu mmu)))
+    (logior (ash high-byte 8) low-byte)))
 
-;; Emulation step
-(defun step-cpu (cpu)
-  (let ((opcode (read-byte-at-pc cpu)))
-    (execute-opcode cpu opcode)))
+;; get an address from a register pair
+(defun get-address-from-register-pair (cpu reg-high reg-low)
+  (let ((high-byte (funcall (intern (format nil "CPU-~A" reg-high)) cpu))
+        (low-byte (funcall (intern (format nil "CPU-~A" reg-low)) cpu)))
+    (logior (ash high-byte 8) low-byte)))
+
+
