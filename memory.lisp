@@ -1,10 +1,18 @@
 (in-package :lispboy)
 
 (defstruct mmu
-  (memory (make-array #x10000 :element-type '(unsigned-byte 8) :initial-element 0)))
+  (data (make-array #10000 :element-type '(unsigned-byte 8))))
 
-(defun read-byte-mm (mmu addr)
-  (aref (mmu-memory mmu) addr))
+(defun read-memory (mmu address)
+  ; ... perform address translation or any MMU logic ...
+  (aref (mmu-data mmu) address))
 
-(defun write-byte-mm (mmu addr value)
-  (setf (aref (mmu-memory mmu) addr) value))
+(defun write-memory (mmu address value)
+  ; ... perform address translation or any MMU logic ...
+  (setf (aref (mmu-data mmu) address) value))
+
+(defun load-rom (mmu stream))
+    (let ((rom-size (file-length stream))
+        (when (> rom-size #x8000)
+            (error "ROM too large or banked ROM not supported")))
+        (read-sequence (mmu-data mmu) stream :end rom-size)))

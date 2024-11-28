@@ -1,14 +1,15 @@
 ;;;; lispboy.asd
 
 (asdf:defsystem #:lispboy
-  :description "Describe lispboy here"
-  :author "Your Name <your.name@example.com>"
+  :description "A gameboy emulator in commmon lisp"
+  :author "Richard Jeffries <richardjjeffries@googlemail.com>"
   :license  "Specify license here"
   :version "0.0.1"
   :serial t
   :depends-on (:cl-json :cl-ppcre)
   :components ((:file "package")
-               (:file "lispboy")
-               (:file "opcodes")
                (:file "memory")
-               (:file "cpu")))
+               (:file "opcodes")
+               (:file "cpu")
+               (:file "cartridge")
+               (:file "lispboy")))
