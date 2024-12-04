@@ -5,7 +5,8 @@
      ,@(loop for reg in registers 
            collect `(,reg 0 :type (unsigned-byte 8)))
            (PC 0 :type (unsigned-byte 16))
-           (SP 0 :type (unsigned-byte 16))))
+           (SP 0 :type (unsigned-byte 16))
+           (cycle-manager (start-cycle-manager))))
 
 (defcpu cpu (A B C D E F H L))
 
@@ -50,6 +51,16 @@
       (2 (format nil "#x~4,'0X" (read-word-at mmu (1+ pc))))
       (otherwise nil))))
 
+(defun format-operand (operand mmu pc)
+  (let ((name (cdr (assoc :name operand))))
+    (case name
+      ("n8" (read-byte-at mmu (1+ pc)))
+      ("n16" (read-word-at mmu (1+ pc)))
+      ("d8" (read-byte-at mmu (1+ pc)))
+      ("a8" (read-byte-at mmu (1+ pc)))
+      ("a16" (read-word-at mmu (1+ pc)))
+      (otherwise name))))
+
 (defun format-instruction (mmu pc opcode operands)
   "Format a complete instruction with its operands and values"
   (let* ((mnemonic (cdr (assoc :mnemonic opcode)))
@@ -58,7 +69,7 @@
                  for value = (read-operand-value mmu pc op)
                  collect (if value
                            (format nil "~A" value)
-                           (format-operand op)))))
+                           (format-operand op mmu pc)))))
     (format nil "~A ~{~A~^, ~}" 
             mnemonic 
             formatted-operands)))
@@ -66,22 +77,17 @@
 (defun disassemble-instruction (mmu pc)
   "Disassemble single instruction at PC, return formatted string and instruction length"
   (let* ((opcode (get-opcode mmu pc))
-         (bytes (cdr (assoc :bytes opcode)))
          (operands (get-operands opcode)))
-    (values
-     (format-instruction mmu pc opcode operands)
-     bytes)))
+     (format-instruction mmu pc opcode operands)))
 
 (defun execute (cpu mmu pc)
   "Execute instruction at PC, return next PC value"
   (setf (cpu-pc cpu) pc) ; This is the only place where the PC is set,
   (let* ((opcode (get-opcode mmu pc))
-         (bytes (cdr (assoc :bytes opcode)))
          (operands (get-operands opcode)))
     
     ;; Debug output
-    (multiple-value-bind (instruction-text _)
-        (disassemble-instruction mmu pc)
+    (let ((instruction-text (disassemble-instruction mmu pc)))
       (format t "~4,'0X: ~A~%" pc instruction-text))
      (execute-instruction cpu mmu opcode operands)))
 
@@ -90,36 +96,43 @@
   (let* ((mnemonic (cdr (assoc :mnemonic opcode)))
          (bytes (cdr (assoc :bytes opcode)))
          (current-pc (cpu-pc cpu))
+         (cycles (first (cdr (assoc :cycles opcode))))
          (next-pc (+ current-pc bytes))) ; Default next PC is current + instruction length
 
     (case (intern mnemonic :keyword)
-      (:NOP next-pc)
+      (:NOP (values next-pc cycles))
       (:LD (execute-ld cpu mmu operands)
-           next-pc)
+           (values next-pc cycles))
       (:LDH (execute-ldh cpu mmu operands) 
-            next-pc)
-      (:INC (execute-inc cpu mmu operands)
-            next-pc)
-      (:DEC (execute-dec cpu mmu operands)
-            next-pc)
-      (:PUSH (execute-push cpu mmu operands) next-pc)
-      (:POP (execute-pop cpu mmu operands) next-pc)
-      (:DI next-pc) ; disable interrupts
+            (values next-pc cycles))
+      (:INC (execute-inc cpu operands)
+            (values next-pc cycles))
+      (:DEC (execute-dec cpu operands)
+            (values next-pc cycles))
+      (:PUSH (execute-push cpu mmu operands) (values next-pc cycles))
+      (:POP (execute-pop cpu mmu operands) (values next-pc cycles))
+      (:DI (values next-pc cycles)) ; disable interrupts
       ;; JP/Call return their own 'next pc'
-      (:JP (execute-jp cpu mmu operands)) 
-      (:CALL (execute-call cpu mmu operands))
-      (:RET (execute-ret cpu mmu operands))
-      (:JR (execute-jr cpu mmu operands))
+      (:JP (execute-jp cpu mmu operands (cdr (assoc :cycles opcode)))) 
+      (:CALL (execute-call cpu mmu operands (cdr (assoc :cycles opcode))))
+      (:RET (execute-ret cpu mmu operands (cdr (assoc :cycles opcode))))
+      (:JR (execute-jr cpu mmu operands (cdr (assoc :cycles opcode))))
       (otherwise 
        (format t "Warning: Unimplemented instruction: ~A~%" mnemonic)
-       next-pc))))
+       (values next-pc 1)))))
 
 (defun execute-ld (cpu mmu operands)
   "Handle LD instructions"
   (let* ((dest (first operands))
          (src (second operands))
          (dest-name (cdr (assoc :name dest)))
-         (src-name (cdr (assoc :name src))))
+         (src-name (cdr (assoc :name src)))
+         (dest-immediate (cdr (assoc :immediate dest)))
+         (src-immediate (cdr (assoc :immediate src)))
+         (dest-increment (cdr (assoc :increment dest)))
+         (src-increment (cdr (assoc :increment src)))
+         (dest-decrement (cdr (assoc :decrement dest)))
+         (src-decrement (cdr (assoc :decrement src))))
     ;; Handle different LD variants
     (cond
       ;; LD r,n - Load immediate 8-bit value into register
@@ -134,8 +147,107 @@
        (setf (cpu-register cpu dest-name)
              (cpu-register cpu src-name)))
       
+      ;; LD r,[HL] - Load from memory into register
+      ((and (register-p dest-name)
+            (equal src-name "HL")
+            (not src-immediate))
+       (setf (cpu-register cpu dest-name)
+             (read-byte-at mmu (get-address-from-register-pair cpu 'H 'L))))
+      
+      ;; LD [HL],r - Load register into memory
+      ((and (equal dest-name "HL")
+            (not dest-immediate)
+            (register-p src-name))
+       (write-byte-at mmu 
+                     (get-address-from-register-pair cpu 'H 'L)
+                     (cpu-register cpu src-name)))
+      
+      ;; LD [HL],n - Load immediate value into memory
+      ((and (equal dest-name "HL")
+            (not dest-immediate)
+            (equal src-name "n8"))
+       (write-byte-at mmu
+                     (get-address-from-register-pair cpu 'H 'L)
+                     (read-byte-at mmu (1+ (cpu-pc cpu)))))
+      
+      ;; LD [BC/DE],A - Load A into memory pointed by BC or DE
+      ((and (member dest-name '("BC" "DE") :test #'equal)
+            (not dest-immediate)
+            (equal src-name "A"))
+       (let ((addr (get-address-from-register-pair cpu 
+                                                  (char dest-name 0)
+                                                  (char dest-name 1))))
+         (write-byte-at mmu addr (cpu-register cpu "A"))))
+      
+      ;; LD A,[BC/DE] - Load from memory pointed by BC or DE into A
+      ((and (equal dest-name "A")
+            (member src-name '("BC" "DE") :test #'equal)
+            (not src-immediate))
+       (let ((addr (get-address-from-register-pair cpu 
+                                                  (char src-name 0)
+                                                  (char src-name 1))))
+         (setf (cpu-register cpu "A")
+               (read-byte-at mmu addr))))
+      
+      ;; LD [HL+],A or LD [HLI],A - Load A into memory and increment HL
+      ((and (equal dest-name "HL")
+            dest-increment
+            (equal src-name "A"))
+       (let ((addr (get-address-from-register-pair cpu 'H 'L)))
+         (write-byte-at mmu addr (cpu-register cpu "A"))
+         (let ((new-hl (logand (1+ addr) #xFFFF)))
+           (setf (cpu-register cpu "H") (ash new-hl -8)
+                 (cpu-register cpu "L") (logand new-hl #xFF)))))
+      
+      ;; LD [HL-],A or LD [HLD],A - Load A into memory and decrement HL
+      ((and (equal dest-name "HL")
+            dest-decrement
+            (equal src-name "A"))
+       (let ((addr (get-address-from-register-pair cpu 'H 'L)))
+         (write-byte-at mmu addr (cpu-register cpu "A"))
+         (let ((new-hl (logand (1- addr) #xFFFF)))
+           (setf (cpu-register cpu "H") (ash new-hl -8)
+                 (cpu-register cpu "L") (logand new-hl #xFF)))))
+      
+      ;; LD A,[HL+] or LD A,[HLI] - Load from memory into A and increment HL
+      ((and (equal dest-name "A")
+            (equal src-name "HL")
+            src-increment)
+       (let ((addr (get-address-from-register-pair cpu 'H 'L)))
+         (setf (cpu-register cpu "A") (read-byte-at mmu addr))
+         (let ((new-hl (logand (1+ addr) #xFFFF)))
+           (setf (cpu-register cpu "H") (ash new-hl -8)
+                 (cpu-register cpu "L") (logand new-hl #xFF)))))
+      
+      ;; LD A,[HL-] or LD A,[HLD] - Load from memory into A and decrement HL
+      ((and (equal dest-name "A")
+            (equal src-name "HL")
+            src-decrement)
+       (let ((addr (get-address-from-register-pair cpu 'H 'L)))
+         (setf (cpu-register cpu "A") (read-byte-at mmu addr))
+         (let ((new-hl (logand (1- addr) #xFFFF)))
+           (setf (cpu-register cpu "H") (ash new-hl -8)
+                 (cpu-register cpu "L") (logand new-hl #xFF)))))
+      
+      ;; LD rr,nn - Load 16-bit immediate value into register pair
+      ((and (member dest-name '("BC" "DE" "HL" "SP") :test #'equal)
+            (equal src-name "n16"))
+       (let ((value (read-word-at mmu (1+ (cpu-pc cpu)))))
+         (if (equal dest-name "SP")
+             (setf (cpu-sp cpu) value)
+             (let ((high (char dest-name 0))
+                   (low (char dest-name 1)))
+               (setf (cpu-register cpu (string high)) (ash value -8)
+                     (cpu-register cpu (string low)) (logand value #xFF))))))
+
+      ;; LD [nn], r - Load 8 bit value at [nn] into register r
+      ((and (equal dest-name "a16")
+            (register-p src-name))
+       (let* ((address (read-word-at mmu (1+ (cpu-pc cpu))))
+             (value (read-byte-at mmu address)))
+         (setf (cpu-register cpu src-name) value)))
       ;; Other LD variants to be implemented
-      (t (format t "Unhandled LD variant~%")))))
+      (t (format t "Unhandled LD variant, operands: ~A~%" operands)))))
 
 
 (defun execute-ldh (cpu mmu operands)
@@ -150,7 +262,7 @@
       (setf (cpu-register cpu dest-name) (read-byte-at mmu address))
       (write-byte-at mmu address (cpu-register cpu src-name)))))
 
-(defun execute-inc (cpu mmu operands) 
+(defun execute-inc (cpu operands) 
   "Handle INC instructions"
   (let* ((target (first operands))
          (target-name (cdr (assoc :name target))))
@@ -162,7 +274,7 @@
         (setf (cpu-flag cpu :n) nil)
         (setf (cpu-flag cpu :h) (= (logand result #x0F) 0))))))
 
-(defun execute-dec (cpu mmu operands)
+(defun execute-dec (cpu operands)
   "Handle DEC instructions"
   (let* ((target (first operands))
          (target-name (cdr (assoc :name target))))
@@ -174,25 +286,25 @@
         (setf (cpu-flag cpu :n) t)
         (setf (cpu-flag cpu :h) (= (logand result #x0F) #xF))))))
 
-(defun execute-jp (cpu mmu operands)
+(defun execute-jp (cpu mmu operands cycles)
   "Handle JP instructions"
   (let ((condition (if (= (length operands) 2) (first operands) nil))
         (next-pc (+ 3 (cpu-pc cpu)))
         (next-addr (read-word-at mmu (1+ (cpu-pc cpu)))))
     (if (or (null condition)
             (check-condition cpu (cdr (assoc :name condition))))
-         next-addr
-         next-pc)))
+         (values next-addr (first cycles))  ; Jump to target
+         (values next-pc (second cycles)))))
 
-(defun execute-jr (cpu mmu operands)
+(defun execute-jr (cpu mmu operands cycles)
   "Handle JR instructions"
   (let ((condition (if (= (length operands) 2) (first operands) nil))
          (next-pc (+ 3 (cpu-pc cpu)))
          (relative-addr (read-word-at mmu (1+ (cpu-pc cpu)))))
      (if (or (null condition)
             (check-condition cpu (cdr (assoc :name condition))))
-        (+ (cpu-pc cpu) relative-addr)
-        next-pc)))
+        (values (+ (cpu-pc cpu) relative-addr (first cycles))
+        (values next-pc (second cycles))))))
         
 (defun execute-pop (cpu mmu operands)
   "Handle POP instructions"
@@ -229,7 +341,7 @@
                             (cpu-register cpu "F"))))))
         (push-word cpu mmu value)))
 
-(defun execute-call (cpu mmu operands)
+(defun execute-call (cpu mmu operands cycles)
   "Handle CALL instructions"
   (let* ((condition (if (= (length operands) 2) (first operands) nil))
          (next-pc (+ 3 (cpu-pc cpu)))
@@ -239,16 +351,17 @@
             (check-condition cpu (cdr (assoc :name condition))))
         (progn
           (push-word cpu mmu next-pc)  ; Save return address
-          target-addr)                  ; Jump to target
-        nil)))                     ; Skip if condition false
+          (values target-addr (first cycles)))                  ; Jump to target
+        (values next-pc (second cycles)))))                    ; Skip if condition false
 
-(defun execute-ret (cpu mmu operands)
+(defun execute-ret (cpu mmu operands cycles)
   "Handle RET instructions"
-  (let ((condition (if operands (first operands) nil)))
+  (let ((condition (if operands (first operands) nil))
+        (next-pc (+ 1 (cpu-pc cpu))))
     (if (or (null condition)
             (check-condition cpu (cdr (assoc :name condition))))
-        (pop-word cpu mmu)
-        nil)))  ; Skip 
+        (values (pop-word cpu mmu) (first cycles))
+        (values next-pc (second cycles)))))  ; Skip 
 
 ;; Helper functions
 (defun register-p (name)
