@@ -6,7 +6,8 @@
            collect `(,reg 0 :type (unsigned-byte 8)))
            (PC 0 :type (unsigned-byte 16))
            (SP 0 :type (unsigned-byte 16))
-           (cycle-manager (start-cycle-manager))))
+           (cycle-manager (start-cycle-manager))
+           (ime nil :type boolean)))
 
 (defcpu cpu (A B C D E F H L))
 
@@ -111,7 +112,13 @@
             (values next-pc cycles))
       (:PUSH (execute-push cpu mmu operands) (values next-pc cycles))
       (:POP (execute-pop cpu mmu operands) (values next-pc cycles))
-      (:DI (values next-pc cycles)) ; disable interrupts
+      (:DI (setf (cpu-ime cpu) nil)  ; Disable interrupts
+           (values next-pc cycles))
+      
+      (:EI (setf (cpu-ime cpu) t)    ; Enable interrupts 
+           (values next-pc cycles))
+      (:RETI (setf (cpu-ime cpu) t)    ; Re-enable interrupts
+             (values (pop-word cpu mmu) cycles)) 
       ;; JP/Call return their own 'next pc'
       (:JP (execute-jp cpu mmu operands (cdr (assoc :cycles opcode)))) 
       (:CALL (execute-call cpu mmu operands (cdr (assoc :cycles opcode))))

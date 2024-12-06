@@ -7,7 +7,9 @@
   (oam (make-array #x100 :element-type '(unsigned-byte 8)))   ; Object Attribute Memory
   (io (make-array #x80 :element-type '(unsigned-byte 8)))     ; I/O Registers
   (hram (make-array #x7F :element-type '(unsigned-byte 8)))   ; High RAM
-  (ie 0 :type (unsigned-byte 8)))                             ; Interrupt Enable Register
+  (if 0 :type (unsigned-byte 8))
+  (ie 0 :type (unsigned-byte 8))
+  (interrupt-lock (bt:make-lock "interrupt-flag-lock")))
 
 (defun read-memory (mmu address)
   "Read a byte from memory at the given address"
@@ -39,10 +41,16 @@
     ;; High RAM ($FF80-$FFFE)
     ((< address #xFFFF)
      (aref (mmu-hram mmu) (- address #xFF80)))
-    
+
+    ;; Interrupt Flag Register ($FF0F) 
+    ((= address #xFF0F)
+     (bt:with-lock-held ((mmu-interrupt-lock mmu))
+       (mmu-if mmu)))
+
     ;; Interrupt Enable Register ($FFFF)
     ((= address #xFFFF)
-     (mmu-ie mmu))
+     (bt:with-lock-held ((mmu-interrupt-lock mmu))
+       (mmu-ie mmu)))
     
     ;; Unused memory ranges return $FF
     (t #xFF)))
@@ -78,9 +86,14 @@
     ((< address #xFFFF)
      (setf (aref (mmu-hram mmu) (- address #xFF80)) value))
     
+     ((= address #xFF0F)
+     (bt:with-lock-held ((mmu-interrupt-lock mmu))
+       (setf (mmu-if mmu) value)))
+    
     ;; Interrupt Enable Register ($FFFF)
     ((= address #xFFFF)
-     (setf (mmu-ie mmu) value))))
+     (bt:with-lock-held ((mmu-interrupt-lock mmu))
+       (setf (mmu-ie mmu) value)))))
 
 (defun dump-rom-section (mmu start end)
   "Dump a section of ROM bytes for verification"

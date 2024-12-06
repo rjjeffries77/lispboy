@@ -34,7 +34,8 @@
                                 (execute (gameboy-cpu gb) (gameboy-mmu gb) pc)
                                 (progn 
                                         (setf pc next-pc)
-                                        (wait-cycles (cpu-cycle-manager (gameboy-cpu gb)) cycles))))))
+                                        (wait-cycles (cpu-cycle-manager (gameboy-cpu gb)) cycles)
+                                        (handle-interrupts (gameboy-cpu gb) (gameboy-mmu gb)))))))
 
 (defparameter a-gameboy (make-gameboy))
 ; testing
