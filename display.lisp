@@ -39,23 +39,69 @@
 (defconstant +nintendo-logo-height+ 8)
 (defconstant +boot-scroll-steps+ 8)   
 
+
+(defvar *window* nil)
+(defvar *renderer* nil)
+(defvar *texture* nil)
+
+(defun init-display ()
+  "Initialize the SDL2 window and renderer"
+  (sdl2:init :video)
+  (handler-case
+    (multiple-value-bind (win renderer)
+        (sdl2:create-window-and-renderer 
+        (* +screen-width+ +scale+)
+        (* +screen-height+ +scale+)
+        '(:shown))
+      (setf *window* win
+            *renderer* renderer
+            *texture* (sdl2:create-texture renderer :rgb888 :streaming 
+                                        +screen-width+ +screen-height+))
+      (sdl2:set-window-title *window* "LispBoy"))
+    (error (c)
+      (format t "Error during display initialization: ~A~%" c)
+      (finish-output)
+      (error c))))
+
 (defun update-display (ppu)
   "Update the display with current framebuffer contents"
-  (sdl:with-events ()
-    (:quit-event () t)
+  (sdl2:with-event-loop (:method :poll)
+    (:quit () t)
     (:idle ()
-     (loop for y from 0 below +screen-height+
-           do (loop for x from 0 below +screen-width+
-                    for pixel = (aref (ppu-framebuffer ppu) 
-                                    (+ (* y +screen-width+) x))
-                    do (sdl:draw-box-* (* x +scale+) 
-                                      (* y +scale+)
-                                      +scale+ 
-                                      +scale+
-                                      :color (sdl:color :r (ldb (byte 8 16) pixel)
-                                                       :g (ldb (byte 8 8) pixel)
-                                                       :b (ldb (byte 8 0) pixel)))))
-     (sdl:update-display))))
+     ;; Create pixel array for texture update
+     (let ((pixels (make-array (* +screen-width+ +screen-height+ 4)
+                              :element-type '(unsigned-byte 8))))
+       ;; Copy framebuffer to pixel array with proper format
+       (loop for i from 0 below (* +screen-width+ +screen-height+)
+             for pixel = (aref (ppu-framebuffer ppu) i)
+             for base = (* i 4)
+             do (setf (aref pixels base) (ldb (byte 8 16) pixel)     ; R
+                      (aref pixels (+ base 1)) (ldb (byte 8 8) pixel) ; G
+                      (aref pixels (+ base 2)) (ldb (byte 8 0) pixel) ; B
+                      (aref pixels (+ base 3)) 255))                  ; A
+       
+       ;; Update texture with new pixels
+       (sdl2:update-texture *texture* nil pixels (* 4 +screen-width+))
+       
+       ;; Clear renderer and copy texture
+       (sdl2:set-render-draw-color *renderer* 0 0 0 255)
+       (sdl2:render-clear *renderer*)
+       (sdl2:render-copy *renderer* *texture*)
+       (sdl2:render-present *renderer*)))))
+
+(defun cleanup-display ()
+  "Clean up SDL2 resources"
+  (when *texture* 
+    (sdl2:destroy-texture *texture*)
+    (setf *texture* nil))
+  (when *renderer*
+    (sdl2:destroy-renderer *renderer*)
+    (setf *renderer* nil))
+  (when *window*
+    (sdl2:destroy-window *window*)
+    (setf *window* nil))
+  (sdl2:quit))
+
 
 (defun draw-scanline (ppu mmu ly)
   "Draw a complete scanline"
@@ -167,12 +213,3 @@
   "Draw sprites for current scanline"
   ;; Implementation for sprite rendering
   )
-
-(defun init-display ()
-  "Initialize the SDL window and renderer"
-  (sdl:init-sdl)
-  (sdl:window (* +screen-width+ +scale+) 
-              (* +screen-height+ +scale+)
-              :title-caption "LispBoy"
-              :icon-caption "LispBoy")
-  (setf (sdl:frame-rate) 60))

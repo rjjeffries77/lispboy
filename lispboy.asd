@@ -6,7 +6,7 @@
   :license  "Specify license here"
   :version "0.0.1"
   :serial t
-  :depends-on (:cl-json :cl-ppcre :lispbuilder-sdl :bordeaux-threads)
+  :depends-on (:cl-json :cl-ppcre :sdl2 :bordeaux-threads)
   :components ((:file "package")
                (:file "timings")
                (:file "memory")
