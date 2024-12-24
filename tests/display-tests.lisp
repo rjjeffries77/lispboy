@@ -1,70 +1,130 @@
 (in-package :lispboy)
 
-(defun create-test-tiles ()
-  "Create an array of test tiles"
-  (let ((tiles (make-array 384 :initial-element nil))) ; Game Boy has 384 tiles
-    ;; Create some test patterns
-    ;; Each tile is 8x8 pixels, 2 bits per pixel = 16 bytes per tile
-    
-    ;; Tile 0: Solid block
-    (setf (aref tiles 0)
-          #(#xFF #xFF #xFF #xFF #xFF #xFF #xFF #xFF
-            #xFF #xFF #xFF #xFF #xFF #xFF #xFF #xFF))
-    
-    ;; Tile 1: Checkerboard
-    (setf (aref tiles 1)
-          #(#xAA #x55 #xAA #x55 #xAA #x55 #xAA #x55
-            #xAA #x55 #xAA #x55 #xAA #x55 #xAA #x55))
-    
-    ;; Tile 2: Border
-    (setf (aref tiles 2)
-          #(#xFF #xFF #x81 #x81 #x81 #x81 #xFF #xFF
-            #xFF #xFF #x81 #x81 #x81 #x81 #xFF #xFF))
-    
-    tiles))
+;; Test utilities
+(defun create-test-ppu ()
+  "Create a PPU instance with known initial state"
+  (let ((ppu (make-ppu)))
+    (setf (ppu-lcdc ppu) #xFF)  ; All features enabled
+    (setf (ppu-bgp ppu) #xE4)   ; Standard Game Boy palette
+    (setf (ppu-scx ppu) 0)
+    (setf (ppu-scy ppu) 0)
+    ppu))
 
-(defun draw-test-tile (ppu tile-data x y)
-  "Draw a single tile at specified position"
-  (loop for row below 8
-        for byte1 = (aref tile-data (* row 2))
-        for byte2 = (aref tile-data (1+ (* row 2)))
-        do (loop for bit below 8
-                 ;; Game Boy uses 2 bits per pixel
-                 for color-id = (logior
-                               (ash (logand (ash byte1 (- bit 7)) 1) 1)
-                               (logand (ash byte2 (- bit 7)) 1))
-                 for color = (case color-id
-                             (0 +color-lightest+)
-                             (1 +color-light+)
-                             (2 +color-dark+)
-                             (3 +color-darkest+))
-                 do (when (and (< (+ x bit) +screen-width+)
-                             (< (+ y row) +screen-height+))
-                      (setf (aref (ppu-framebuffer ppu)
-                                (+ (* (+ y row) +screen-width+)
-                                   (+ x bit)))
-                            color)))))
+(defun create-test-mmu ()
+  "Create an MMU instance with test pattern"
+  (let ((mmu (make-mmu)))
+    ;; Write a simple tile pattern to VRAM
+    ;; This creates a simple 8x8 checkerboard pattern
+    (loop for i from 0 below 16
+          do (write-memory mmu (+ #x8000 i) 
+                          (if (evenp i) #xAA #x55)))
+    
+    ;; Set up tile map
+    (write-memory mmu #x9800 0)  ; First tile is our test pattern
+    mmu))
 
-(defun test-tile-patterns ()
-  "Display a set of test tiles"
-  (let ((ppu (make-ppu))
-        (tiles (create-test-tiles)))
-    (init-display)
-    (sdl:with-events ()
-      (:quit-event () t)
-      (:key-press-event (:key key)
-        (when (eq key :sdl-key-escape)
-          (sdl:push-quit-event)))
-      (:idle ()
-       ;; Clear screen
-       (sdl:clear-display sdl:*black*)
-       ;; Draw test tiles
-       (loop for i below 3 ; Number of test tiles
-             for x = (* i 10)
-             for y = 10
-             do (draw-test-tile ppu (aref tiles i) (* x 8) (* y 8)))
-       ;; Update display
-       (update-display ppu)))))
+;; Basic framebuffer tests
+(defun test-set-pixel ()
+  "Test basic pixel setting functionality"
+  (let ((ppu (create-test-ppu)))
+    (format t "Testing set-pixel...~%")
+    
+    ;; Test setting pixels at various positions
+    (set-pixel ppu 0 0 +color-darkest+)
+    (set-pixel ppu 159 143 +color-lightest+)
+    
+    ;; Verify pixels were set correctly
+    (let ((color0 (cffi:mem-aref (ppu-framebuffer ppu) :uint32 0))
+          (color-last (cffi:mem-aref (ppu-framebuffer ppu) :uint32 
+                                    (+ (* 143 +screen-width+) 159))))
+      (format t "First pixel color: ~X (expected ~X)~%" 
+              color0 +color-darkest+)
+      (format t "Last pixel color: ~X (expected ~X)~%" 
+              color-last +color-lightest+)
+      
+      ;; Cleanup
+      (cleanup-display ppu)
+      
+      ;; Return test results
+      (and (= color0 +color-darkest+)
+           (= color-last +color-lightest+)))))
 
-;; Export tile test function
-(export '(test-tile-patterns))
+;; Test background rendering
+(defun test-background-scanline ()
+  "Test background scanline rendering"
+  (let ((ppu (create-test-ppu))
+        (mmu (create-test-mmu)))
+    (format t "Testing background scanline rendering...~%")
+    
+    ;; Draw first scanline
+    (draw-background-scanline ppu mmu 0)
+    
+    ;; Check first 8 pixels of the scanline
+    (let ((expected-pattern #(#x9BBC0F #x8BAC0F #x9BBC0F #x8BAC0F 
+                            #x9BBC0F #x8BAC0F #x9BBC0F #x8BAC0F)))
+      (loop for x from 0 below 8
+            for expected across expected-pattern
+            for actual = (cffi:mem-aref (ppu-framebuffer ppu) :uint32 x)
+            do (format t "Pixel ~D: ~X (expected ~X)~%" 
+                      x actual expected)
+            unless (= actual expected)
+            do (format t "Mismatch at pixel ~D~%" x)
+               (return-from test-background-scanline nil)))
+    
+    ;; Cleanup
+    (cleanup-display ppu)
+    t))
+
+;; Test full display update cycle
+(defun test-display-update ()
+  "Test complete display update cycle"
+  (format t "Testing display update...~%")
+  (let ((ppu (create-test-ppu)))
+    (handler-case
+        (progn
+          ;; Initialize display
+          (init-display)
+          (format t "Display initialized~%")
+          
+          ;; Draw a test pattern
+          (loop for y from 0 below +screen-height+
+                do (loop for x from 0 below +screen-width+
+                        do (set-pixel ppu x y 
+                                    (if (evenp (+ x y))
+                                        +color-light+
+                                        +color-dark+))))
+          
+          ;; Try to update display
+          (update-display ppu)
+          (format t "Display updated successfully~%")
+          
+          ;; Sleep briefly to see the result
+          (sleep 0.1)
+          
+          ;; Cleanup
+          (cleanup-display ppu)
+          t)
+      (error (c)
+        (format t "Error during display test: ~A~%" c)
+        nil))))
+
+;; Run all tests
+(defun run-display-tests ()
+  "Run all display system tests"
+  (format t "Running display system tests...~%~%")
+  (let ((results (list
+                 (cons "set-pixel" (test-set-pixel))
+                 (cons "background-scanline" (test-background-scanline))
+                 (cons "display-update" (test-display-update)))))
+    
+    (format t "~%Test Results:~%")
+    (loop for (test . result) in results
+          do (format t "~A: ~A~%" 
+                    test 
+                    (if result "PASS" "FAIL")))
+    
+    ;; Return true only if all tests passed
+    (every #'cdr results)))
+
+;; Export test functions
+(export '(run-display-tests))

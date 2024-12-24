@@ -3,6 +3,7 @@
 (defconstant +screen-width+ 160)
 (defconstant +screen-height+ 144)
 (defconstant +scale+ 3)
+(defconstant +framebuffer-size+ (* +screen-width+ +screen-height+))
 
 (defconstant +color-darkest+ #x0F380F)
 (defconstant +color-dark+ #x306230)
@@ -18,6 +19,9 @@
 (defconstant +lcdc-obj-enable+ #x02)
 (defconstant +lcdc-bg-enable+ #x01)
 
+(cffi:defcstruct framebuffer-array
+  (pixels :uint32 :count 23040))
+
 (defstruct ppu
   (lcdc 0 :type (unsigned-byte 8))
   (stat 0 :type (unsigned-byte 8))
@@ -30,9 +34,16 @@
   (scy 0 :type (unsigned-byte 8))
   (wx 0 :type (unsigned-byte 8))
   (wy 0 :type (unsigned-byte 8))
-  (framebuffer (make-array (* +screen-width+ +screen-height+) 
-                          :element-type '(unsigned-byte 32) 
-                          :initial-element +color-lightest+)))
+  (framebuffer (cffi:null-pointer) :type cffi:foreign-pointer))
+
+(defun make-ppu-with-framebuffer ()
+  (let ((ppu (make-ppu)))
+    (setf (ppu-framebuffer ppu)
+          (cffi:foreign-alloc '(:struct framebuffer-array)))
+    (loop for i from 0 below (* +screen-width+ +screen-height+)
+          do (setf (cffi:mem-aref (ppu-framebuffer ppu) :uint32 i)
+                   +color-lightest+))
+    ppu))
 
 ; Data for Nintendo logo
 (defconstant +nintendo-logo-width+ 12)
@@ -48,16 +59,16 @@
   "Initialize the SDL2 window and renderer"
   (sdl2:init :video)
   (handler-case
-    (multiple-value-bind (win renderer)
-        (sdl2:create-window-and-renderer 
-        (* +screen-width+ +scale+)
-        (* +screen-height+ +scale+)
-        '(:shown))
-      (setf *window* win
-            *renderer* renderer
-            *texture* (sdl2:create-texture renderer :rgb888 :streaming 
-                                        +screen-width+ +screen-height+))
-      (sdl2:set-window-title *window* "LispBoy"))
+      (multiple-value-bind (win renderer)
+          (sdl2:create-window-and-renderer 
+           (* +screen-width+ +scale+)
+           (* +screen-height+ +scale+)
+           '(:shown))
+        (setf *window* win
+              *renderer* renderer
+              *texture* (sdl2:create-texture renderer :rgb888 :streaming 
+                                           +screen-width+ +screen-height+))
+        (sdl2:set-window-title *window* "LispBoy"))
     (error (c)
       (format t "Error during display initialization: ~A~%" c)
       (finish-output)
@@ -68,29 +79,21 @@
   (sdl2:with-event-loop (:method :poll)
     (:quit () t)
     (:idle ()
-     ;; Create pixel array for texture update
-     (let ((pixels (make-array (* +screen-width+ +screen-height+ 4)
-                              :element-type '(unsigned-byte 8))))
-       ;; Copy framebuffer to pixel array with proper format
-       (loop for i from 0 below (* +screen-width+ +screen-height+)
-             for pixel = (aref (ppu-framebuffer ppu) i)
-             for base = (* i 4)
-             do (setf (aref pixels base) (ldb (byte 8 16) pixel)     ; R
-                      (aref pixels (+ base 1)) (ldb (byte 8 8) pixel) ; G
-                      (aref pixels (+ base 2)) (ldb (byte 8 0) pixel) ; B
-                      (aref pixels (+ base 3)) 255))                  ; A
-       
-       ;; Update texture with new pixels
-       (sdl2:update-texture *texture* nil pixels (* 4 +screen-width+))
-       
-       ;; Clear renderer and copy texture
-       (sdl2:set-render-draw-color *renderer* 0 0 0 255)
-       (sdl2:render-clear *renderer*)
-       (sdl2:render-copy *renderer* *texture*)
-       (sdl2:render-present *renderer*)))))
+     ;; Update texture directly from foreign memory
+     (sdl2:update-texture *texture* nil 
+                         (ppu-framebuffer ppu)
+                         (* 4 +screen-width+))
+     
+     ;; Clear renderer and copy texture
+     (sdl2:set-render-draw-color *renderer* 0 0 0 255)
+     (sdl2:render-clear *renderer*)
+     (sdl2:render-copy *renderer* *texture*)
+     (sdl2:render-present *renderer*))))
 
-(defun cleanup-display ()
-  "Clean up SDL2 resources"
+(defun cleanup-display (ppu)
+  (when (not (cffi:null-pointer-p (ppu-framebuffer ppu)))
+    (cffi:foreign-free (ppu-framebuffer ppu))
+    (setf (ppu-framebuffer ppu) (cffi:null-pointer)))
   (when *texture* 
     (sdl2:destroy-texture *texture*)
     (setf *texture* nil))
@@ -102,6 +105,13 @@
     (setf *window* nil))
   (sdl2:quit))
 
+;; Helper function to set pixel in foreign framebuffer
+(defun set-pixel (ppu x y color)
+  (when (and (>= x 0) (< x +screen-width+)
+             (>= y 0) (< y +screen-height+))
+    (setf (cffi:mem-aref (ppu-framebuffer ppu) :uint32 
+                         (+ (* y +screen-width+) x))
+          color)))
 
 (defun draw-scanline (ppu mmu ly)
   "Draw a complete scanline"
@@ -143,14 +153,13 @@
     
     ;; Draw all pixels in the scanline
     (loop for screen-x from 0 below +screen-width+
-          for x = (mod (+ screen-x scx) 256)
-          for tile-col = (floor x 8)
-          for pixel-x = (mod x 8)
-          do
-             (let* (;; Get the tile number from the map
+          do (let* ((x (mod (+ screen-x scx) 256))
+                    (tile-col (floor x 8))
+                    (pixel-x (mod x 8))
+                    ;; Get the tile number from the map
                     (map-addr (+ tile-map-base 
-                               (+ (* tile-row 32) 
-                                  tile-col)))
+                                (+ (* tile-row 32) 
+                                   tile-col)))
                     (tile-num (read-memory mmu map-addr))
                     ;; Calculate tile data address
                     (tile-addr (if (zerop (logand lcdc +lcdc-bg-tile-data+))
@@ -168,8 +177,8 @@
                     ;; Extract the color value for this pixel
                     (color-bit (- 7 pixel-x))
                     (color-num (logior
-                              (ash (logand (ash byte2 (- color-bit)) 1) 1)
-                              (logand (ash byte1 (- color-bit)) 1)))
+                               (ash (logand (ash byte2 (- color-bit)) 1) 1)
+                               (logand (ash byte1 (- color-bit)) 1)))
                     ;; Convert the 2-bit color to actual RGB using BGP register
                     (palette-color (logand (ash (ppu-bgp ppu) 
                                               (* -2 color-num))
@@ -180,10 +189,19 @@
                             (1 +color-light+)
                             (2 +color-dark+)
                             (3 +color-darkest+))))
-               ;; Set the pixel in the framebuffer
-               (setf (aref (ppu-framebuffer ppu)
-                          (+ (* ly +screen-width+) screen-x))
-                     color)))))
+               ;; Set the pixel using the new set-pixel function
+               (set-pixel ppu screen-x ly color)))))
+
+;; Placeholder functions for window and sprite drawing
+(defun draw-window-scanline (ppu mmu ly)
+  "Draw window tiles for current scanline"
+  ;; Window drawing implementation here
+  nil)
+
+(defun draw-sprites-scanline (ppu mmu ly)
+  "Draw sprites for current scanline"
+  ;; Sprite drawing implementation here
+  nil)
 
 (defun init-nintendo-logo (ppu mmu)
   "Initialize PPU with Nintendo logo data"
@@ -199,17 +217,7 @@
   
   ;; Initialize PPU registers
   (setf (ppu-lcdc ppu) (logior +lcdc-display-enable+
-                              +lcdc-bg-enable+))
+                               +lcdc-bg-enable+))
   (setf (ppu-bgp ppu) #xFC)  ; 11111100 - Normal palette
   (setf (ppu-scx ppu) 44)    ; Center horizontally
-  (setf (ppu-scy ppu) 48))  
-  
-(defun draw-window-scanline (ppu ly)
-  "Draw window tiles for current scanline"
-  ;; Similar to background but using window registers
-  )
-
-(defun draw-sprites-scanline (ppu ly)
-  "Draw sprites for current scanline"
-  ;; Implementation for sprite rendering
-  )
+  (setf (ppu-scy ppu) 48))

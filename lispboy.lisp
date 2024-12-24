@@ -9,7 +9,7 @@
 (defstruct gameboy 
   (cpu (make-cpu))
   (mmu (make-mmu))
-  (ppu (make-ppu)))
+  (ppu (make-ppu-with-framebuffer)))
 
 (defun load-cartridge (gb filename)
   (format t "~%Starting cartridge load: ~A~%" filename)
@@ -44,25 +44,28 @@
     ;; Run display for logo animation
     (format t "~%Starting logo animation loop...~%")
     (finish-output)
-    (loop for frame from 0 below 60
-          do (format t "Frame ~D/60~%" frame)
-             (finish-output)
-             (loop for ly from 0 below +screen-height+
-                   do (draw-scanline ppu mmu ly))
-             (update-display ppu)
-             (sleep 0.016))
-    
-    (format t "~%Logo animation complete. Starting main execution...~%")
-    (finish-output)
-    
-    (loop while (< pc end-address)
-          do (format t "PC: ~4,'0X~%" pc)
-             (finish-output)
-             (multiple-value-bind (next-pc cycles)
-                 (execute (gameboy-cpu gb) (gameboy-mmu gb) pc)
-               (setf pc next-pc)
-               (wait-cycles (cpu-cycle-manager (gameboy-cpu gb)) cycles)
-               (handle-interrupts (gameboy-cpu gb) (gameboy-mmu gb))))))
+        (unwind-protect 
+        (progn
+          (loop for frame from 0 below 60
+                do (format t "Frame ~D/60~%" frame)
+                   (finish-output)
+                   (loop for ly from 0 below +screen-height+
+                         do (draw-scanline ppu mmu ly))
+                   (update-display ppu)
+                   (sleep 0.016))
+          
+          (format t "~%Logo animation complete. Starting main execution...~%")
+          (finish-output)
+          
+          (loop while (< pc end-address)
+                do (format t "PC: ~4,'0X~%" pc)
+                   (finish-output)
+                   (multiple-value-bind (next-pc cycles)
+                       (execute (gameboy-cpu gb) (gameboy-mmu gb) pc)
+                     (setf pc next-pc)
+                     (wait-cycles (cpu-cycle-manager (gameboy-cpu gb)) cycles)
+                     (handle-interrupts (gameboy-cpu gb) (gameboy-mmu gb)))))
+      (cleanup-display ppu))))
 
 (defparameter a-gameboy (make-gameboy))
 

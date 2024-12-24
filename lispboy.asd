@@ -6,7 +6,7 @@
   :license  "Specify license here"
   :version "0.0.1"
   :serial t
-  :depends-on (:cl-json :cl-ppcre :sdl2 :bordeaux-threads)
+  :depends-on (:cffi :cl-json :cl-ppcre :sdl2 :bordeaux-threads)
   :components ((:file "package")
                (:file "timings")
                (:file "memory")
@@ -14,4 +14,6 @@
                (:file "cpu")
                (:file "cartridge")
                (:file "display")
-               (:file "lispboy")))
+               (:file "lispboy")
+               (:file "tests/display-tests")
+               (:file "tests/cpu-tests")))
