@@ -29,8 +29,8 @@
 
 ;; get an address from a register pair.
 (defun get-address-from-register-pair (cpu reg-high reg-low)
-  (let ((high-byte (funcall (intern (format nil "CPU-~A" reg-high)) cpu))
-        (low-byte (funcall (intern (format nil "CPU-~A" reg-low)) cpu)))
+  (let ((high-byte (funcall (intern (format nil "CPU-~A" reg-high) :lispboy)  cpu))
+        (low-byte (funcall (intern (format nil "CPU-~A" reg-low) :lispboy)  cpu)))
     (logior (ash high-byte 8) low-byte)))
 
 ;; Get the mnemonic associative array for the instruction.
@@ -108,8 +108,11 @@
             (values next-pc cycles))
       (:INC (execute-inc cpu operands)
             (values next-pc cycles))
-      (:DEC (execute-dec cpu operands)
-            (values next-pc cycles))
+      (:DEC (execute-dec cpu operands) (values next-pc cycles))
+      (:OR (execute-or cpu operands) (values next-pc cycles))
+      (:ADD (execute-add cpu mmu operands) (values next-pc cycles))
+      (:CP (execute-cp cpu mmu operands) (values next-pc cycles))
+      (:SUB (execute-sub cpu mmu operands) (values next-pc cycles))
       (:PUSH (execute-push cpu mmu operands) (values next-pc cycles))
       (:POP (execute-pop cpu mmu operands) (values next-pc cycles))
       (:DI (setf (cpu-ime cpu) nil)  ; Disable interrupts
@@ -159,22 +162,22 @@
             (equal src-name "HL")
             (not src-immediate))
        (setf (cpu-register cpu dest-name)
-             (read-byte-at mmu (get-address-from-register-pair cpu 'H 'L))))
+             (read-byte-at mmu (get-address-from-register-pair cpu "H" "L"))))
       
-      ;; LD [HL],r - Load register into memory
+      ;; Ld [HL],r - Load register into memory
       ((and (equal dest-name "HL")
             (not dest-immediate)
             (register-p src-name))
        (write-byte-at mmu 
-                     (get-address-from-register-pair cpu 'H 'L)
-                     (cpu-register cpu src-name)))
+                      (get-address-from-register-pair cpu "H" "L")
+                      (cpu-register cpu src-name)))
       
       ;; LD [HL],n - Load immediate value into memory
       ((and (equal dest-name "HL")
             (not dest-immediate)
             (equal src-name "n8"))
        (write-byte-at mmu
-                     (get-address-from-register-pair cpu 'H 'L)
+                     (get-address-from-register-pair cpu "H" "L")
                      (read-byte-at mmu (1+ (cpu-pc cpu)))))
       
       ;; LD [BC/DE],A - Load A into memory pointed by BC or DE
@@ -230,7 +233,7 @@
       ((and (equal dest-name "A")
             (equal src-name "HL")
             src-decrement)
-       (let ((addr (get-address-from-register-pair cpu 'H 'L)))
+       (let ((addr (get-address-from-register-pair cpu "H" "L")))
          (setf (cpu-register cpu "A") (read-byte-at mmu addr))
          (let ((new-hl (logand (1- addr) #xFFFF)))
            (setf (cpu-register cpu "H") (ash new-hl -8)
@@ -305,13 +308,19 @@
 
 (defun execute-jr (cpu mmu operands cycles)
   "Handle JR instructions"
-  (let ((condition (if (= (length operands) 2) (first operands) nil))
-         (next-pc (+ 3 (cpu-pc cpu)))
-         (relative-addr (read-word-at mmu (1+ (cpu-pc cpu)))))
-     (if (or (null condition)
+  (let* ((condition (if (= (length operands) 2) (first operands) nil))
+         (next-pc (+ 2 (cpu-pc cpu)))  ; JR is only 2 bytes
+         (offset (read-byte-at mmu (1+ (cpu-pc cpu))))  ; Read single byte offset
+         ;; Convert to signed byte (-128 to 127)
+         (relative-offset (if (> offset 127)
+                              (- offset 256)
+                              offset)))
+    (if (or (null condition)
             (check-condition cpu (cdr (assoc :name condition))))
-        (values (+ (cpu-pc cpu) relative-addr (first cycles))
-        (values next-pc (second cycles))))))
+        ;; If condition is met, add offset to current PC + 2
+        (values (logand #xFFFF (+ next-pc relative-offset)) (first cycles))
+        ;; If condition not met, go to next instruction
+        (values next-pc (second cycles)))))
         
 (defun execute-pop (cpu mmu operands)
   "Handle POP instructions"
@@ -369,6 +378,162 @@
             (check-condition cpu (cdr (assoc :name condition))))
         (values (pop-word cpu mmu) (first cycles))
         (values next-pc (second cycles)))))  ; Skip 
+
+(defun execute-or (cpu operands)
+  "Execute OR instruction"
+  (let* ((source (second operands))
+         (source-name (cdr (assoc :name source)))
+         (source-value (if (register-p source-name)
+                           (cpu-register cpu source-name)
+                           source-name)))
+    ;; OR always targets register A
+    (let ((result (logior (cpu-register cpu "A") source-value)))
+      (setf (cpu-register cpu "A") (logand result #xFF))
+      (setf (cpu-flag cpu :z) (zerop result)
+            (cpu-flag cpu :n) nil
+            (cpu-flag cpu :h) nil
+            (cpu-flag cpu :c) nil))))
+
+(defun execute-add (cpu mmu operands)
+  "Execute ADD instruction"
+  (let* ((target (first operands))
+         (source (second operands))
+         (target-name (cdr (assoc :name target)))
+         (source-name (cdr (assoc :name source))))
+
+    (cond
+      ;; ADD A,r8 or ADD A,n8 - 8-bit addition to A register
+      ((equal target-name "A")
+       (let* ((source-value (cond
+                              ((register-p source-name)
+                               (cpu-register cpu source-name))
+                              ((equal source-name "n8")
+                               (read-byte-at mmu (1+ (cpu-pc cpu))))
+                              ((equal source-name "HL")
+                               (read-byte-at mmu 
+                                             (get-address-from-register-pair cpu 'H 'L)))
+                              (t source-name)))
+              (result (+ (cpu-register cpu "A") source-value))
+              (half-carry (> (logand (logxor (cpu-register cpu "A") 
+                                             source-value 
+                                             result) 
+                                     #x10) 
+                             0)))
+         ;; Store result
+         (setf (cpu-register cpu "A") (logand result #xFF))
+         ;; Set flags
+         (setf (cpu-flag cpu :z) (zerop (logand result #xFF))
+               (cpu-flag cpu :n) nil
+               (cpu-flag cpu :h) half-carry
+               (cpu-flag cpu :c) (> result #xFF))))
+
+      ;; ADD HL,rr - 16-bit addition to HL register
+      ((equal target-name "HL")
+       (let* ((hl-value (get-address-from-register-pair cpu 'H 'L))
+              (source-value (cond
+                              ((member source-name '("BC" "DE" "HL") :test #'equal)
+                               (get-address-from-register-pair cpu 
+                                                               (char source-name 0)
+                                                               (char source-name 1)))
+                              ((equal source-name "SP")
+                               (cpu-sp cpu))
+                              (t source-name)))
+              (result (+ hl-value source-value))
+              (half-carry (> (logand (logxor hl-value source-value result) 
+                                     #x1000) 
+                             0)))
+         ;; Store result
+         (setf (cpu-register cpu "H") (logand (ash result -8) #xFF)
+               (cpu-register cpu "L") (logand result #xFF))
+         ;; Set flags (preserves Z flag)
+         (setf (cpu-flag cpu :n) nil
+               (cpu-flag cpu :h) half-carry
+               (cpu-flag cpu :c) (> result #xFFFF))))
+
+      ;; ADD SP,e8 - Add signed 8-bit immediate to SP
+      ((equal target-name "SP")
+       (let* ((offset (read-byte-at mmu (1+ (cpu-pc cpu))))
+              ;; Convert to signed
+              (signed-offset (if (> offset 127)
+                                 (- offset 256)
+                                 offset))
+              (result (+ (cpu-sp cpu) signed-offset))
+              (half-carry (> (logand (logxor (cpu-sp cpu) 
+                                             signed-offset 
+                                             result)
+                                     #x10)
+                             0)))
+         ;; Store result
+         (setf (cpu-sp cpu) (logand result #xFFFF))
+         ;; Set all flags
+         (setf (cpu-flag cpu :z) nil
+               (cpu-flag cpu :n) nil
+               (cpu-flag cpu :h) half-carry
+               (cpu-flag cpu :c) (> result #xFFFF)))))))
+
+(defun execute-cp (cpu mmu operands)
+  "Execute CP (Compare) instruction"
+  (let* ((target (first operands))
+         (source (second operands))
+         (a-value (cpu-register cpu "A"))
+         (source-value 
+           (cond
+             ;; CP with register
+             ((register-p (cdr (assoc :name source)))
+              (cpu-register cpu (cdr (assoc :name source))))
+             
+             ;; CP with immediate value (n8)
+             ((equal (cdr (assoc :name source)) "n8")
+              (read-byte-at mmu (1+ (cpu-pc cpu))))
+             
+             ;; CP with [HL]
+             ((and (equal (cdr (assoc :name source)) "HL")
+                   (not (cdr (assoc :immediate source))))
+              (read-byte-at mmu (get-address-from-register-pair cpu "H" "L")))
+             
+             (t (error "Unknown source for CP instruction"))))
+         
+         ;; Calculate result (but don't store it)
+         (result (- a-value source-value)))
+    
+    (setf (cpu-flag cpu :z) (zerop (logand result #xFF))
+          (cpu-flag cpu :n) t
+          (cpu-flag cpu :h) (> (logand (logxor a-value source-value result) #x10) 0)
+          (cpu-flag cpu :c) (< a-value source-value))))
+
+(defun execute-sub (cpu mmu operands)
+  "Execute SUB instruction"
+  (let* ((target (first operands))
+         (source (second operands))
+         (a-value (cpu-register cpu "A"))
+         (source-value 
+           (cond
+             ;; SUB with register
+             ((register-p (cdr (assoc :name source)))
+              (cpu-register cpu (cdr (assoc :name source))))
+             
+             ;; SUB with immediate value (n8)
+             ((equal (cdr (assoc :name source)) "n8")
+              (read-byte-at mmu (1+ (cpu-pc cpu))))
+             
+             ;; SUB with [HL]
+             ((and (equal (cdr (assoc :name source)) "HL")
+                   (not (cdr (assoc :immediate source))))
+              (read-byte-at mmu (get-address-from-register-pair cpu "H" "L")))
+             
+             (t (error "Unknown source for SUB instruction"))))
+         
+         ;; Calculate result
+         (result (- a-value source-value)))
+    
+    ;; Store result in A register
+    (setf (cpu-register cpu "A") (logand result #xFF))
+    
+    (setf (cpu-flag cpu :z) (zerop (logand result #xFF))
+          (cpu-flag cpu :n) t
+          (cpu-flag cpu :h) (> (logand (logxor a-value source-value result) #x10) 0)
+          (cpu-flag cpu :c) (< a-value source-value))))
+
 
 ;; Helper functions
 (defun register-p (name)

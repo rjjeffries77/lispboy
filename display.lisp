@@ -1,3 +1,4 @@
+
 (in-package :lispboy)
 
 (defconstant +screen-width+ 160)
@@ -19,6 +20,20 @@
 (defconstant +lcdc-obj-enable+ #x02)
 (defconstant +lcdc-bg-enable+ #x01)
 
+;; PPU timing constants
+(defconstant +mode-2-cycles+ 80)    ; OAM search - 80 cycles
+(defconstant +mode-3-cycles+ 172)   ; Pixel transfer - 172-289 cycles
+(defconstant +mode-0-cycles+ 208)   ; H-Blank - 87-204 cycles
+(defconstant +scanline-cycles+ 456) ; Total cycles per scanline
+(defconstant +vblank-scanlines+ 10) ; Number of V-Blank scanlines
+
+;; STAT register bit masks
+(defconstant +stat-mode-flag+ #x03)      ; Current PPU mode
+(defconstant +stat-coincidence+ #x04)    ; LYC=LY coincidence flag
+(defconstant +stat-mode-0-int+ #x08)     ; Mode 0 H-Blank interrupt
+(defconstant +stat-mode-1-int+ #x10)     ; Mode 1 V-Blank interrupt
+(defconstant +stat-mode-2-int+ #x20)     ; Mode 2 OAM interrupt
+(defconstant +stat-coincidence-int+ #x40) ; LY=LYC interrupt
 (cffi:defcstruct framebuffer-array
   (pixels :uint32 :count 23040))
 
@@ -48,62 +63,7 @@
 ; Data for Nintendo logo
 (defconstant +nintendo-logo-width+ 12)
 (defconstant +nintendo-logo-height+ 8)
-(defconstant +boot-scroll-steps+ 8)   
-
-
-(defvar *window* nil)
-(defvar *renderer* nil)
-(defvar *texture* nil)
-
-(defun init-display ()
-  "Initialize the SDL2 window and renderer"
-  (sdl2:init :video)
-  (handler-case
-      (multiple-value-bind (win renderer)
-          (sdl2:create-window-and-renderer 
-           (* +screen-width+ +scale+)
-           (* +screen-height+ +scale+)
-           '(:shown))
-        (setf *window* win
-              *renderer* renderer
-              *texture* (sdl2:create-texture renderer :rgb888 :streaming 
-                                           +screen-width+ +screen-height+))
-        (sdl2:set-window-title *window* "LispBoy"))
-    (error (c)
-      (format t "Error during display initialization: ~A~%" c)
-      (finish-output)
-      (error c))))
-
-(defun update-display (ppu)
-  "Update the display with current framebuffer contents"
-  (sdl2:with-event-loop (:method :poll)
-    (:quit () t)
-    (:idle ()
-     ;; Update texture directly from foreign memory
-     (sdl2:update-texture *texture* nil 
-                         (ppu-framebuffer ppu)
-                         (* 4 +screen-width+))
-     
-     ;; Clear renderer and copy texture
-     (sdl2:set-render-draw-color *renderer* 0 0 0 255)
-     (sdl2:render-clear *renderer*)
-     (sdl2:render-copy *renderer* *texture*)
-     (sdl2:render-present *renderer*))))
-
-(defun cleanup-display (ppu)
-  (when (not (cffi:null-pointer-p (ppu-framebuffer ppu)))
-    (cffi:foreign-free (ppu-framebuffer ppu))
-    (setf (ppu-framebuffer ppu) (cffi:null-pointer)))
-  (when *texture* 
-    (sdl2:destroy-texture *texture*)
-    (setf *texture* nil))
-  (when *renderer*
-    (sdl2:destroy-renderer *renderer*)
-    (setf *renderer* nil))
-  (when *window*
-    (sdl2:destroy-window *window*)
-    (setf *window* nil))
-  (sdl2:quit))
+(defconstant +boot-scroll-steps+ 8)
 
 ;; Helper function to set pixel in foreign framebuffer
 (defun set-pixel (ppu x y color)

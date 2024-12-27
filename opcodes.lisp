@@ -8,23 +8,10 @@
 
 (setf json:*json-identifier-name-to-lisp* #'custom-name-to-lisp)
 
-;(defvar opcodes 
-;  (with-open-file (stream (merge-pathnames #P"projects/lispboy/Opcodes.json" (user-homedir-pathname)))
-;    (json:decode-json stream)))
-
-; Convert to hash table for O(1) lookup
-;(defun opcode-hashmap (opcode-a)
-;  (let ((table (make-hash-table)))
-;    (dolist (pair (cdr opcode-a) table)
-;      (setf (gethash (parse-integer (subseq (string (car pair)) 2) :radix 16) table) 
-;        (cdr pair)))))
-(defvar opcodes 
-  (progn
-    ;(format t "Loading JSON file...~%")
-    (with-open-file (stream (merge-pathnames #P"Opcodes.json" *default-pathname-defaults*))
-      (let ((result (json:decode-json stream)))
-     ;   (format t "JSON loaded, result type: ~A~%" (type-of result))
-        result))))
+(defvar opcodes
+  (let ((source-dir (asdf:system-source-directory (asdf:find-system :lispboy))))
+    (with-open-file (stream (merge-pathnames #P"Opcodes.json" source-dir))
+      (json:decode-json stream))))
 
 (defun opcode-hashmap (opcode-a)
   (let ((table (make-hash-table)))
