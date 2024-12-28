@@ -181,3 +181,33 @@
   (setf (ppu-bgp ppu) #xFC)  ; 11111100 - Normal palette
   (setf (ppu-scx ppu) 44)    ; Center horizontally
   (setf (ppu-scy ppu) 48))
+
+(defun update-ppu-state (ppu mmu current-dots)
+  "Update PPU state based on current dot count"
+  (let* ((scanline (ppu-ly ppu))
+         (line-dots (mod current-dots +scanline-cycles+))
+         (old-mode (ppu-mode ppu)))
+    
+    ;; Update mode based on dot position in scanline
+    (setf (ppu-mode ppu)
+          (cond 
+            ((>= scanline +vblank-start+) 1)  ; VBlank
+            ((<= line-dots +mode-2-cycles+) 2) ; OAM Search
+            ((<= line-dots (+ +mode-2-cycles+ +mode-3-cycles+)) 3) ; Pixel Transfer
+            (t 0))) ; H-Blank
+
+    ;; Handle mode transitions
+    (when (/= old-mode (ppu-mode ppu))
+      (case (ppu-mode ppu)
+        (0  ; Entering H-Blank
+         (when (lcdc-display-enabled-p ppu)
+           (render-scanline ppu mmu scanline)))
+        (1  ; Entering V-Blank
+         (when (= scanline +vblank-start+)
+           (request-vblank-interrupt mmu)))
+        (2  ; Starting new scanline
+         (when (= line-dots 0)
+           (incf (ppu-ly ppu))
+           ;; Reset window line counter at start of frame
+           (when (zerop scanline)
+             (setf (ppu-window-line ppu) 0))))))

@@ -8,6 +8,7 @@
   :serial t
   :depends-on (:cffi :cl-json :cl-ppcre :sdl2 :bordeaux-threads)
   :components ((:file "package")
+               (:file "hirestimer")
                (:file "timings")
                (:file "memory")
                (:file "opcodes")

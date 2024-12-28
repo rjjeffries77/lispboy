@@ -4,19 +4,19 @@
   (cycle-count 0 :type integer)
   (running t :type boolean)
   (last-frame-time (get-nanoseconds) :type integer)
-  ;; Separate tracking for CPU and PPU
+  ;; Track cycles separately for CPU and PPU
   (cpu-cycles 0 :type integer)
-  (ppu-dots 0 :type integer)  ; PPU dots (1 dot = 4 CPU cycles)
-  (frame-count 0 :type integer)
-  ;; Synchronization
+  (ppu-dots 0 :type integer)  
+  ;; Synchronization primitives
   (frame-lock (bt:make-lock "frame-lock"))
-  (frame-condition (bt:make-condition-variable :name "frame-condition"))
   (cpu-lock (bt:make-lock "cpu-lock"))
+  (cpu-condition (bt:make-condition-variable))
   (ppu-lock (bt:make-lock "ppu-lock"))
-  (cpu-condition (bt:make-condition-variable :name "cpu-condition"))
-  (ppu-condition (bt:make-condition-variable :name "ppu-condition")))
+  (ppu-condition (bt:make-condition-variable)))
 
-
+(defconstant +cpu-cycles-per-frame+ 70224)  ; 4194304 Hz / ~59.73 fps
+(defconstant +ppu-dots-per-frame+ 17556)    ; CPU cycles / 4
+(defconstant +target-frame-time+ (floor (* 1000000000 (/ 1.0 59.73))))
 (defconstant +cycles-per-second+ 4194304)
 (defconstant +cycles-per-frame+ 70224)  ; 4194304 / 59.73
 (defconstant +target-fps+ 59.73)
