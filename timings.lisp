@@ -2,13 +2,27 @@
 
 (defstruct cycle-manager
   (cycle-count 0 :type integer)
-  (target-cycles 0 :type integer)
-  (running nil :type boolean)
-  (lock (bt:make-lock))
-  (condition (bt:make-condition-variable)))
+  (running t :type boolean)
+  (last-frame-time (get-nanoseconds) :type integer)
+  ;; Separate tracking for CPU and PPU
+  (cpu-cycles 0 :type integer)
+  (ppu-dots 0 :type integer)  ; PPU dots (1 dot = 4 CPU cycles)
+  (frame-count 0 :type integer)
+  ;; Synchronization
+  (frame-lock (bt:make-lock "frame-lock"))
+  (frame-condition (bt:make-condition-variable :name "frame-condition"))
+  (cpu-lock (bt:make-lock "cpu-lock"))
+  (ppu-lock (bt:make-lock "ppu-lock"))
+  (cpu-condition (bt:make-condition-variable :name "cpu-condition"))
+  (ppu-condition (bt:make-condition-variable :name "ppu-condition")))
 
-(defparameter *cycles-per-second* 4194304) ; 4.194304 MHz
-(defparameter *nanoseconds-per-cycle* (/ 1000000000 *cycles-per-second*))
+
+(defconstant +cycles-per-second+ 4194304)
+(defconstant +cycles-per-frame+ 70224)  ; 4194304 / 59.73
+(defconstant +target-fps+ 59.73)
+(defconstant +nanoseconds-per-frame+ (floor (* 1000000000 (/ 1.0 +target-fps+))))
+(defconstant +internal-time-units-per-cycle+ 
+  (/ internal-time-units-per-second +cycles-per-second+))
 
 ;interrupts
 (defconstant +vblank-int+ #x01)
@@ -55,42 +69,30 @@
   (push-word cpu mmu (cpu-pc cpu))
   (setf (cpu-pc cpu) vector))
 
-(defun cycle-counter-loop (manager)
-  "Main loop for cycle counting thread"
-  (let ((last-time (get-internal-real-time)))
-    (loop while (cycle-manager-running manager) do
-      (let* ((current-time (get-internal-real-time))
-             (elapsed-time (- current-time last-time))
-             (elapsed-cycles (round (* elapsed-time
-                                    (/ *cycles-per-second*
-                                       internal-time-units-per-second)))))
-        (when (> elapsed-cycles 0)
-          (bt:with-lock-held ((cycle-manager-lock manager))
-            (incf (cycle-manager-cycle-count manager) elapsed-cycles)
-            ; Notify any waiting threads if we've hit target
-            (when (>= (cycle-manager-cycle-count manager)
-                     (cycle-manager-target-cycles manager))
-              (bt:condition-notify (cycle-manager-condition manager))))
-          (setf last-time current-time)))
-      ; Small sleep to prevent spinning
-      (sleep 0.000001)))) ; 1 microsecond
+(defun wait-for-next-frame (timer)
+  "Wait until it's time for the next frame"
+  (let* ((current-time (get-nanoseconds))
+         (target-time (+ (frame-timer-last-frame-time timer) 
+                         +nanoseconds-per-frame+)))
+    (when (< current-time target-time)
+      ;; Sleep for most of the remaining time
+      (let ((sleep-ns (- target-time current-time 100000))) ; Leave 100μs for precision
+        (when (> sleep-ns 0)
+          (sleep (/ sleep-ns 1000000000.0))))
+      ;; Spin-wait for the remainder
+      (loop while (< (get-nanoseconds) target-time)))
+    (setf (frame-timer-last-frame-time timer) target-time)
+    (incf (frame-timer-frame-count timer))
+    (setf (frame-timer-cycles-this-frame timer) 0)))
 
-(defun start-cycle-manager ()
-  "Create and start a new cycle manager"
-  (let ((manager (make-cycle-manager)))
-    (setf (cycle-manager-running manager) t)
-    ; Start cycle counting thread
-    (bt:make-thread
-     (lambda ()
-       (cycle-counter-loop manager))
-     :name "CPU Cycle Counter")
-    manager))
-
-(defun wait-cycles (manager cycles)
-  "Wait for a specified number of cycles to elapse"
-  (bt:with-lock-held ((cycle-manager-lock manager))
-    (let ((target (+ (cycle-manager-cycle-count manager) cycles)))
-      (setf (cycle-manager-target-cycles manager) target)
-      (loop while (< (cycle-manager-cycle-count manager) target) do
-        (bt:condition-wait (cycle-manager-condition manager)
-                          (cycle-manager-lock manager))))))
+(defun print-timing-stats (timer)
+  (let* ((elapsed-ns (- (get-nanoseconds) 
+                        (frame-timer-last-frame-time timer)))
+         (elapsed-seconds (/ elapsed-ns 1000000000.0))
+         (frames (frame-timer-frame-count timer))
+         (actual-fps (/ frames elapsed-seconds)))
+    (format t "Frames: ~D~%" frames)
+    (format t "Time: ~,2f seconds~%" elapsed-seconds)
+    (format t "FPS: ~,2f~%" actual-fps)
+    (format t "Target FPS: ~,2f~%" +target-fps+)
+    (format t "FPS Accuracy: ~,2f%~%" (* 100 (/ actual-fps +target-fps+)))))

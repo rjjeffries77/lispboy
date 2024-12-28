@@ -32,7 +32,7 @@
   (setf (cpu-ime cpu) nil)   ; IME starts disabled
   
   ;; Reset cycle manager
-  (setf (cpu-cycle-manager cpu) (start-cycle-manager))
+  (setf (cpu-cycle-manager cpu) (make-cycle-manager))
   
   cpu) ; Return the reset CPU
 
@@ -122,95 +122,98 @@
 (defparameter a-gameboy (make-gameboy))
 (defparameter *emulator-running* T)
 
+(defun run-timing-thread (gb)
+  "Main timing thread that drives both CPU and PPU"
+  (let* ((cpu (gameboy-cpu gb))
+         (timer (cycle-manager cpu)))
+    (loop while (cycle-manager-running timer) do
+          (let* ((current-time (get-nanoseconds))
+                 (target-time (+ (cycle-manager-last-frame-time timer)
+                                 +nanoseconds-per-frame+)))
+            ;; Wait for next frame time
+            (when (< current-time target-time)
+              (sleep (/ (- target-time current-time) 1000000000.0)))
+            
+            ;; Signal new frame to CPU and PPU threads
+            (bt:with-lock-held ((cycle-manager-frame-lock timer))
+              (bt:condition-notify (cycle-manager-frame-condition timer))
+              (incf (cycle-manager-frame-count timer))
+              (setf (cycle-manager-last-frame-time timer)
+                    (get-nanoseconds)))))))
 
-(defun run-display-loop (gb)
-  "Main PPU emulation loop"
-  (let* ((ppu (gameboy-ppu gb))
-         (mmu (gameboy-mmu gb))
-         (cycle-count 0)
-         (current-mode 2))  ; Start in Mode 2 (OAM Search)
-    
-    (loop while *emulator-running* do
-          ;; Update PPU mode and handle mode-specific tasks
-          (case current-mode
-            ;; Mode 2 - OAM Search (80 cycles)
-            (2 (progn
-                 (setf (ppu-stat ppu)
-                       (logior (logand (ppu-stat ppu) #xFC) 2))
-                 (when (>= cycle-count +mode-2-cycles+)
-                   (setf current-mode 3
-                         cycle-count 0))))
-            
-            ;; Mode 3 - Pixel Transfer (172+ cycles)
-            (3 (progn
-                 (setf (ppu-stat ppu)
-                       (logior (logand (ppu-stat ppu) #xFC) 3))
-                 (when (>= cycle-count +mode-3-cycles+)
-                   ;; Draw the current scanline
-                   (draw-scanline ppu mmu (ppu-ly ppu))
-                   (setf current-mode 0
-                         cycle-count 0))))
-            
-            ;; Mode 0 - H-Blank (208+ cycles)
-            (0 (progn
-                 (setf (ppu-stat ppu)
-                       (logand (ppu-stat ppu) #xFC))
-                 (when (>= cycle-count +mode-0-cycles+)
-                   ;; End of scanline
-                   (incf (ppu-ly ppu))
-                   (write-memory mmu #xFF44 (ppu-ly ppu))
-                   ;; Check if we've hit V-Blank
-                   (if (>= (ppu-ly ppu) 144)
-                       (progn
-                         (setf current-mode 1)
-                         ;; Set V-Blank interrupt flag
-                         (setf (mmu-if mmu)
-                               (logior (mmu-if mmu) #x01)))
-                       (setf current-mode 2))
-                   (setf cycle-count 0))))
-            
-            ;; Mode 1 - V-Blank (10 scanlines)
-            (1 (progn
-                 (setf (ppu-stat ppu)
-                       (logior (logand (ppu-stat ppu) #xFC) 1))
-                 (incf cycle-count)
-                 (when (>= cycle-count +scanline-cycles+)
-                   (incf (ppu-ly ppu))
-                   (write-memory mmu #xFF44 (ppu-ly ppu))
-                   (when (>= (ppu-ly ppu) 154)
-                     ;; End of frame
-                     (setf (ppu-ly ppu) 0
-                           current-mode 2))
-                   (setf cycle-count 0)))))
+(defun run-ppu-loop (gb)
+  "PPU thread"
+  (let* ((cpu (gameboy-cpu gb))
+         (ppu (gameboy-ppu gb))
+         (timer (cpu-cycle-manager cpu))
+         (mode 2)  ; Start in OAM search mode
+         (line-cycles 0))
+    (loop while (frame-timer-running timer) do
+          ;; Wait for CPU to process 4 cycles
+          (bt:with-lock-held ((cycle-manager-ppu-lock timer))
+            (bt:condition-wait (cycle-manager-ppu-condition timer)
+                               (cycle-manager-ppu-lock timer)))
           
-          ;; Update LYC coincidence flag
-          (let ((coincidence (= (ppu-ly ppu) (ppu-lyc ppu))))
-            (setf (ppu-stat ppu)
-                  (if coincidence
-                      (logior (ppu-stat ppu) +stat-coincidence+)
-                      (logand (ppu-stat ppu) (lognot +stat-coincidence+))))
-            
-            ;; Generate STAT interrupt if enabled
-            (when (and coincidence
-                       (not (zerop (logand (ppu-stat ppu) +stat-coincidence-int+))))
-              (setf (mmu-if mmu)
-                    (logior (mmu-if mmu) #x02))))
+          ;; Update PPU state
+          (incf line-cycles 4)
+          (case mode
+            (2 (when (>= line-cycles +mode-2-cycles+)
+                 (setf mode 3)))
+            (3 (when (>= line-cycles +mode-3-cycles+)
+                 (setf mode 0)
+                 (draw-scanline ppu (gameboy-mmu gb) (ppu-ly ppu))))
+            (0 (when (>= line-cycles +scanline-cycles+)
+                 (setf line-cycles 0)
+                 (incf (ppu-ly ppu))
+                 (write-memory (gameboy-mmu gb) #xFF44 (ppu-ly ppu))
+                 (if (>= (ppu-ly ppu) 144)
+                     (setf mode 1)     ; Enter VBlank
+                     (setf mode 2))))) ; Start next line
           
-          ;; Increment cycle count and wait
-          (incf cycle-count)
-          (sleep 0.000001))))
+          ;; Check for end of frame
+          (when (and (= mode 1) (>= (ppu-ly ppu) 154))
+            (setf (ppu-ly ppu) 0)
+            (write-memory (gameboy-mmu gb) #xFF44 0)
+            (setf mode 2)
+            ;; Wait for next frame signal
+            (bt:with-lock-held ((cycle-manager-frame-lock timer))
+              (bt:condition-wait (cycle-manager-frame-condition timer)
+                                 (cycle-manager-frame-lock timer)))))))
 
-
-(defun run-cpu-loop (gb)
+(Defun run-cpu-loop (gb)
   ;; run the fetch-decode-execute
-  (let ((mmu (gameboy-mmu gb))
-        (cpu (gameboy-cpu gb)))
-    (loop while *emulator-running*
-          do (multiple-value-bind (next-pc cycles)
-                 (execute cpu mmu (cpu-pc cpu))
-               (setf (cpu-pc cpu) next-pc)
-               (wait-cycles (cpu-cycle-manager cpu) cycles)
-               (handle-interrupts cpu mmu)))))
+  (let* ((cpu (gameboy-cpu gb))
+         (timer (cpu-cycle-manager cpu)))
+    (loop while (cycle-manager-running timer) do
+          ;; Get cycles at start of frame
+          (let ((frame-start-cycles (cycle-manager-cpu-cycles timer)))
+            ;; Run CPU cycles until we hit cycles-per-frame
+            (loop while (< (- (cycle-manager-cpu-cycles timer) frame-start-cycles)
+                           +cycles-per-frame+)
+                  do
+                  ;; Execute one CPU instruction
+                  (multiple-value-bind (next-pc cycles)
+                      (execute cpu (gameboy-mmu gb) (cpu-pc cpu))
+                    ;; Update CPU state
+                    (setf (cpu-pc cpu) next-pc)
+                    
+                    ;; Update cycle count atomically
+                    (bt:with-lock-held ((cycle-manager-cpu-lock timer))
+                      (incf (cycle-manager-cpu-cycles timer) cycles)
+                      ;; Notify PPU if needed (every 4 cycles)
+                      (when (zerop (mod (cycle-manager-cpu-cycles timer) 4))
+                        (bt:with-lock-held ((cycle-manager-ppu-lock timer))
+                          (bt:condition-notify (cycle-manager-ppu-condition timer)))))
+                    
+                    ;; Handle interrupts
+                    (handle-interrupts cpu (gameboy-mmu gb))))
+            
+            ;; Wait for next frame signal
+            (bt:with-lock-held ((cycle-manager-frame-lock timer))
+              (bt:condition-wait (cycle-manager-frame-condition timer)
+                                 (cycle-manager-frame-lock timer)))))))
+
+
 
 (defun emulator-main (gb)
   (sdl2:with-init (:everything)
@@ -220,7 +223,10 @@
         (let* ((ppu (gameboy-ppu gb))
                (texture (sdl2:create-texture renderer :rgb888 :streaming 
                                              +screen-width+ +screen-height+))
-               (display-thread (bt:make-thread (lambda () (run-display-loop gb)) :name "display-thread"))
+               (timing-thread (bt:make-thread 
+                               (lambda () (run-timing-thread gb))
+                               :name "timing-thread"))
+               (display-thread (bt:make-thread (lambda () (run-ppu-loop gb)) :name "display-thread"))
                (cpu-thread (bt:make-thread (lambda () (run-cpu-loop gb)) :name "cpu-thread")))
 
           (sdl2:with-event-loop (:method :poll)

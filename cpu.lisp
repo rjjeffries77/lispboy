@@ -6,7 +6,7 @@
            collect `(,reg 0 :type (unsigned-byte 8)))
            (PC 0 :type (unsigned-byte 16))
            (SP 0 :type (unsigned-byte 16))
-           (cycle-manager (start-cycle-manager))
+           (cycle-manager (make-cycle-manager))
            (ime nil :type boolean)))
 
 (defcpu cpu (A B C D E F H L))
@@ -107,12 +107,16 @@
       (:LDH (execute-ldh cpu mmu operands) 
             (values next-pc cycles))
       (:INC (execute-inc cpu operands)
-            (values next-pc cycles))
+       (values next-pc cycles))
+      (:RRA (execute-rra cpu operands)
+       (values next-pc cycles))
       (:DEC (execute-dec cpu operands) (values next-pc cycles))
       (:OR (execute-or cpu operands) (values next-pc cycles))
       (:ADD (execute-add cpu mmu operands) (values next-pc cycles))
+      (:ADC (execute-adc cpu mmu operands) (values next-pc cycles))
       (:CP (execute-cp cpu mmu operands) (values next-pc cycles))
       (:SUB (execute-sub cpu mmu operands) (values next-pc cycles))
+      (:SBC (execute-sbc cpu mmu operands) (values next-pc cycles))
       (:PUSH (execute-push cpu mmu operands) (values next-pc cycles))
       (:POP (execute-pop cpu mmu operands) (values next-pc cycles))
       (:DI (setf (cpu-ime cpu) nil)  ; Disable interrupts
@@ -249,6 +253,34 @@
                    (low (char dest-name 1)))
                (setf (cpu-register cpu (string high)) (ash value -8)
                      (cpu-register cpu (string low)) (logand value #xFF))))))
+
+      ((and (equal dest-name "HL")
+            (equal src-name "SP")
+            (assoc :increment src))  ; This identifies the SP+e8 variant
+       (let* ((offset (read-byte-at mmu (1+ (cpu-pc cpu))))
+              ;; Convert to signed byte (-128 to 127)
+              (signed-offset (if (> offset 127)
+                                 (- offset 256)
+                                 offset))
+              (result (+ (cpu-sp cpu) signed-offset)))
+         ;; Store result in HL
+         (setf (cpu-register cpu "H") (ash (logand result #xFFFF) -8)
+               (cpu-register cpu "L") (logand result #xFF))
+         ;; Set flags according to GB CPU manual for this instruction
+         (setf (cpu-flag cpu :z) nil      ; Reset
+               (cpu-flag cpu :n) nil      ; Reset
+               ;; Half carry if carry from bit 3
+               (cpu-flag cpu :h) (> (logand (logxor (cpu-sp cpu) 
+                                                    signed-offset 
+                                                    result)
+                                            #x10)
+                                    0)
+               ;; Carry if carry from bit 7
+               (cpu-flag cpu :c) (> (logand (logxor (cpu-sp cpu) 
+                                                    signed-offset 
+                                                    result)
+                                            #x100)
+                                    0))))
 
       ;; LD [nn], r - Load 8 bit value at [nn] into register r
       ((and (equal dest-name "a16")
@@ -533,6 +565,107 @@
           (cpu-flag cpu :n) t
           (cpu-flag cpu :h) (> (logand (logxor a-value source-value result) #x10) 0)
           (cpu-flag cpu :c) (< a-value source-value))))
+
+(defun execute-adc (cpu mmu operands)
+  "Execute ADC (Add with Carry) instruction"
+  (let* ((target (first operands))
+         (source (second operands))
+         (a-value (cpu-register cpu "A"))
+         (carry-value (if (cpu-flag cpu :c) 1 0))
+         (source-value 
+           (cond
+             ;; ADC with register
+             ((register-p (cdr (assoc :name source)))
+              (cpu-register cpu (cdr (assoc :name source))))
+             
+             ;; ADC with immediate value (n8)
+             ((equal (cdr (assoc :name source)) "n8")
+              (read-byte-at mmu (1+ (cpu-pc cpu))))
+             
+             ;; ADC with [HL]
+             ((and (equal (cdr (assoc :name source)) "HL")
+                   (not (cdr (assoc :immediate source))))
+              (read-byte-at mmu (get-address-from-register-pair cpu "H" "L")))
+             
+             (t (error "Unknown source for ADC instruction"))))
+         
+         ;; Calculate result including carry
+         (result (+ a-value source-value carry-value))
+         
+         ;; Check for half carry: carry from bit 3 to bit 4
+         (half-carry (> (logand (+ (logand a-value #xF) 
+                                   (logand source-value #xF)
+                                   carry-value) 
+                                #x10) 
+                        0)))
+    
+    ;; Store result in A register
+    (setf (cpu-register cpu "A") (logand result #xFF))
+    (setf (cpu-flag cpu :z) (zerop (logand result #xFF))
+          (cpu-flag cpu :n) nil
+          (cpu-flag cpu :h) half-carry
+          (cpu-flag cpu :c) (> result #xFF))))
+
+
+(defun execute-sbc (cpu mmu operands)
+  "Execute SBC (Subtract with Carry) instruction"
+  (let* ((target (first operands))
+         (source (second operands))
+         (a-value (cpu-register cpu "A"))
+         (carry-value (if (cpu-flag cpu :c) 1 0))
+         (source-value 
+           (cond
+             ;; SBC with register
+             ((register-p (cdr (assoc :name source)))
+              (cpu-register cpu (cdr (assoc :name source))))
+             
+             ;; SBC with immediate value (n8)
+             ((equal (cdr (assoc :name source)) "n8")
+              (read-byte-at mmu (1+ (cpu-pc cpu))))
+             
+             ;; SBC with [HL]
+             ((and (equal (cdr (assoc :name source)) "HL")
+                   (not (cdr (assoc :immediate source))))
+              (read-byte-at mmu (get-address-from-register-pair cpu "H" "L")))
+             
+             (t (error "Unknown source for SBC instruction"))))
+         
+         ;; Calculate result including borrow (carry)
+         (result (- a-value source-value carry-value))
+         
+         ;; Check for half-borrow: borrow from bit 4
+         (half-carry (> (logand (logxor a-value source-value result) #x10) 0)))
+    
+    ;; Store result in A register
+    (setf (cpu-register cpu "A") (logand result #xFF))
+    
+    ;; Set flags according to GB CPU manual:
+    ;; Z - Set if result is zero
+    ;; N - Set (indicating subtraction)
+    ;; H - Set if borrow from bit 4
+    ;; C - Set if borrow needed (result < 0)
+    (setf (cpu-flag cpu :z) (zerop (logand result #xFF))
+          (cpu-flag cpu :n) t
+          (cpu-flag cpu :h) half-carry
+          (cpu-flag cpu :c) (< result 0))))
+
+(defun execute-rra (cpu operands)
+  "Execute RRA (Rotate Right through Accumulator) instruction"
+  (let* ((a-value (cpu-register cpu "A"))
+         (old-carry (if (cpu-flag cpu :c) 1 0))
+         ;; Get bit 0 to become new carry
+         (new-carry (logand a-value 1))
+         ;; Rotate right, putting old carry in bit 7
+         (result (logior (ash (logand a-value #xFF) -1)
+                         (ash old-carry 7))))
+    
+    ;; Store result in A
+    (setf (cpu-register cpu "A") result)
+    
+    (setf (cpu-flag cpu :z) nil
+          (cpu-flag cpu :n) nil
+          (cpu-flag cpu :h) nil
+          (cpu-flag cpu :c) (= new-carry 1))))
 
 
 ;; Helper functions

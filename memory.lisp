@@ -105,49 +105,47 @@
           do (format t "~2,'0X " byte))
     (format t "~%")))
 
+
 (defun load-rom (mmu stream)
-  "Load a full memory dump into appropriate MMU arrays"
-  (let ((dump-size (file-length stream)))
-    (when (/= dump-size #x10000)
-      (error "Expected 64KB memory dump, got ~D bytes" dump-size))
-    
-    ;; Read the full dump into a temporary array
-    (let ((full-dump (make-array #x10000 :element-type '(unsigned-byte 8))))
-      (read-sequence full-dump stream)
+    "Load a ROM into appropriate MMU arrays"
+    (let ((rom-size (file-length stream)))
+      ;; Check for valid ROM sizes (32KB or 64KB)
+      (unless (or (= rom-size #x8000)   ; 32KB
+                  (= rom-size #x10000))  ; 64KB
+        (error "Invalid ROM size: ~D bytes. Expected 32KB or 64KB" rom-size))
       
-      ;; Copy each section to appropriate MMU array
-      ;; ROM ($0000-$7FFF)
-      (replace (mmu-rom mmu) full-dump :end1 #x8000)
-      
-      ;; VRAM ($8000-$9FFF)
-      (replace (mmu-vram mmu) 
-              full-dump 
-              :start2 #x8000 
-              :end2 #xA000)
-      
-      ;; Work RAM ($C000-$DFFF)
-      (replace (mmu-wram mmu) 
-              full-dump 
-              :start2 #xC000 
-              :end2 #xE000)
-      
-      ;; OAM ($FE00-$FE9F)
-      (replace (mmu-oam mmu) 
-              full-dump 
-              :start2 #xFE00 
-              :end2 #xFEA0)
-      
-      ;; I/O Registers ($FF00-$FF7F)
-      (replace (mmu-io mmu) 
-              full-dump 
-              :start2 #xFF00 
-              :end2 #xFF80)
-      
-      ;; High RAM ($FF80-$FFFE)
-      (replace (mmu-hram mmu) 
-              full-dump 
-              :start2 #xFF80 
-              :end2 #xFFFF)
-      
-      ;; Interrupt Enable Register ($FFFF)
-      (setf (mmu-ie mmu) (aref full-dump #xFFFF)))))
+      (cond
+        ;; 32KB ROM
+        ((= rom-size #x8000)
+         ;; Read the ROM data into a temporary buffer
+         (let ((rom-data (make-array rom-size :element-type '(unsigned-byte 8))))
+           (read-sequence rom-data stream)
+           ;; Copy ROM data to MMU ROM space (first 32KB)
+           (replace (mmu-rom mmu) rom-data)))
+        
+        ;; 64KB full memory dump
+        ((= rom-size #x10000)
+         (let ((full-dump (make-array rom-size :element-type '(unsigned-byte 8))))
+           (read-sequence full-dump stream)
+           
+           ;; Copy each section to appropriate MMU array
+           ;; ROM ($0000-$7FFF)
+           (replace (mmu-rom mmu) full-dump :end1 #x8000)
+           
+           ;; VRAM ($8000-$9FFF)
+           (replace (mmu-vram mmu) full-dump :start2 #x8000 :end2 #xA000)
+           
+           ;; Work RAM ($C000-$DFFF)
+           (replace (mmu-wram mmu) full-dump :start2 #xC000 :end2 #xE000)
+           
+           ;; OAM ($FE00-$FE9F)
+           (replace (mmu-oam mmu) full-dump :start2 #xFE00 :end2 #xFEA0)
+           
+           ;; I/O Registers ($FF00-$FF7F)
+           (replace (mmu-io mmu) full-dump :start2 #xFF00 :end2 #xFF80)
+           
+           ;; High RAM ($FF80-$FFFE)
+           (replace (mmu-hram mmu) full-dump :start2 #xFF80 :end2 #xFFFF)
+           
+           ;; Interrupt Enable Register ($FFFF)
+           (setf (mmu-ie mmu) (aref full-dump #xFFFF)))))))
