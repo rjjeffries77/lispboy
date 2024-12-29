@@ -90,7 +90,7 @@
     ;; Debug output
     (let ((instruction-text (disassemble-instruction mmu pc)))
       (format t "~4,'0X: ~A~%" pc instruction-text))
-     (execute-instruction cpu mmu opcode operands)))
+    (execute-instruction cpu mmu opcode operands)))
 
 (defun execute-instruction (cpu mmu opcode operands)
   "Execute a single instruction"

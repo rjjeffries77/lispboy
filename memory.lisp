@@ -95,6 +95,12 @@
      (bt:with-lock-held ((mmu-interrupt-lock mmu))
        (setf (mmu-ie mmu) value)))))
 
+(defun request-interrupt (mmu interrupt-bit)
+  "Request interrupt by setting the corresponding bit in IF"
+  (bt:with-lock-held ((mmu-interrupt-lock mmu))
+    (setf (mmu-if mmu) 
+          (logior (mmu-if mmu) interrupt-bit))))
+
 (defun dump-rom-section (mmu start end)
   "Dump a section of ROM bytes for verification"
   (format t "~%ROM contents from ~4,'0X to ~4,'0X:~%" start end)

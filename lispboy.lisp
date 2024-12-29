@@ -128,6 +128,7 @@
          (timer (cpu-cycle-manager cpu)))
     (loop while *emulator-running* do
           (let ((frame-start (get-nanoseconds)))
+
             ;; Signal CPU and PPU to start processing frame
             (bt:with-lock-held ((cycle-manager-frame-lock timer))
               ;; Reset cycle counts for new frame
@@ -148,6 +149,7 @@
   "PPU thread"
   (let* ((cpu (gameboy-cpu gb))
          (ppu (gameboy-ppu gb))
+         (mmu (gameboy-mmu gb))
          (timer (cpu-cycle-manager cpu))
          (mode 2)  ; Start in OAM search mode
          (line-cycles 0))
@@ -161,11 +163,12 @@
           (loop while (< (cycle-manager-ppu-dots timer) +ppu-dots-per-frame+) do
                 ;; Wait for next dot from CPU
                 (bt:with-lock-held ((cycle-manager-ppu-lock timer))
-                  (bt:condition-wait (cycle-manager-ppu-condition timer)                                     (cycle-manager-ppu-lock timer)))
+                  (bt:condition-wait (cycle-manager-ppu-condition timer)
+                                     (cycle-manager-ppu-lock timer)))
                 
                 ;; Update PPU state machine
                 (let ((current-dots (cycle-manager-ppu-dots timer)))
-                  (update-ppu-state ppu current-dots))))))
+                  (update-ppu-state ppu mmu current-dots))))))
 
 
 (Defun run-cpu-loop (gb)

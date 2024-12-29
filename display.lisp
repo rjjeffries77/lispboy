@@ -5,6 +5,7 @@
 (defconstant +screen-height+ 144)
 (defconstant +scale+ 3)
 (defconstant +framebuffer-size+ (* +screen-width+ +screen-height+))
+ 
 
 (defconstant +color-darkest+ #x0F380F)
 (defconstant +color-dark+ #x306230)
@@ -21,6 +22,8 @@
 (defconstant +lcdc-bg-enable+ #x01)
 
 ;; PPU timing constants
+(defconstant +vblank-start+ 144)    ; First VBlank line
+(defconstant +vblank-end+ 153)  
 (defconstant +mode-2-cycles+ 80)    ; OAM search - 80 cycles
 (defconstant +mode-3-cycles+ 172)   ; Pixel transfer - 172-289 cycles
 (defconstant +mode-0-cycles+ 208)   ; H-Blank - 87-204 cycles
@@ -49,6 +52,8 @@
   (scy 0 :type (unsigned-byte 8))
   (wx 0 :type (unsigned-byte 8))
   (wy 0 :type (unsigned-byte 8))
+  (mode 2 :type (integer 0 3))
+  (window-line 0 :type integer)
   (framebuffer (cffi:null-pointer) :type cffi:foreign-pointer))
 
 (defun make-ppu-with-framebuffer ()
@@ -73,7 +78,7 @@
                          (+ (* y +screen-width+) x))
           color)))
 
-(defun draw-scanline (ppu mmu ly)
+(defun render-scanline (ppu mmu ly)
   "Draw a complete scanline"
   (when (not (zerop (logand (ppu-lcdc ppu) +lcdc-display-enable+)))
     ;; Draw background
@@ -182,6 +187,69 @@
   (setf (ppu-scx ppu) 44)    ; Center horizontally
   (setf (ppu-scy ppu) 48))
 
+(defun request-vblank-interrupt (mmu)
+  "Request VBlank interrupt through MMU"
+  (request-interrupt mmu #x01)) ; VBlank is bit 0
+
+(defun request-lcd-stat-interrupt (mmu)
+  "Request LCD STAT interrupt through MMU"
+  (request-interrupt mmu #x02)) 
+
+(defun update-stat-register (ppu mmu)
+  "Update LCD STAT register (FF41) and trigger STAT interrupts if enabled"
+  (let ((stat (ppu-stat ppu))
+        (current-mode (ppu-mode ppu)))
+    
+    ;; Clear previous mode bits and set new mode
+    (setf stat (logand stat #xFC))        ; Clear bottom 2 bits
+    (setf stat (logior stat current-mode)) ; Set new mode
+    
+    ;; Set coincidence flag (Bit 2) if LY = LYC
+    (if (= (ppu-ly ppu) (ppu-lyc ppu))
+        (setf stat (logior stat #x04))    ; Set bit 2
+        (setf stat (logand stat #xFB)))   ; Clear bit 2
+    
+    ;; Check if we should trigger STAT interrupt
+    (let ((interrupt-requested nil))
+      ;; Check each interrupt source if enabled
+      (cond
+        ;; Mode 0 (H-Blank) interrupt
+        ((and (= current-mode 0)
+              (logbitp 3 stat))
+         (setf interrupt-requested t))
+        
+        ;; Mode 1 (V-Blank) interrupt
+        ((and (= current-mode 1)
+              (logbitp 4 stat))
+         (setf interrupt-requested t))
+        
+        ;; Mode 2 (OAM) interrupt
+        ((and (= current-mode 2)
+              (logbitp 5 stat))
+         (setf interrupt-requested t))
+        
+        ;; LY=LYC coincidence interrupt
+        ((and (= (ppu-ly ppu) (ppu-lyc ppu))
+              (logbitp 6 stat))
+         (setf interrupt-requested t)))
+      
+      ;; If any interrupt was requested, set LCD STAT bit in IF
+      (when interrupt-requested
+        (let ((if-reg (mmu-if mmu)))
+          (setf (mmu-if mmu) (logior if-reg #x02)))))
+    
+    ;; Update STAT register in memory
+    (write-memory mmu #xFF41 stat)
+    (setf (ppu-stat ppu) stat)))
+
+(defun lcdc-flag-set-p (ppu flag)
+  "Check if a specific LCDC flag is set"
+  (not (zerop (logand (ppu-lcdc ppu) flag))))
+
+(defun lcdc-display-enabled-p (ppu)
+  "Check if LCD display is enabled (bit 7 of LCDC)"
+  (lcdc-flag-set-p ppu +lcdc-display-enable+))
+
 (defun update-ppu-state (ppu mmu current-dots)
   "Update PPU state based on current dot count"
   (let* ((scanline (ppu-ly ppu))
@@ -208,6 +276,9 @@
         (2  ; Starting new scanline
          (when (= line-dots 0)
            (incf (ppu-ly ppu))
+           (write-memory mmu #xFF44 (ppu-ly ppu))
+           (format t "PPU LY updated to ~A~%" (ppu-ly ppu))
            ;; Reset window line counter at start of frame
            (when (zerop scanline)
              (setf (ppu-window-line ppu) 0))))))
+    (update-stat-register ppu mmu)))
