@@ -112,6 +112,8 @@
        (values next-pc cycles))
       (:DEC (execute-dec cpu operands) (values next-pc cycles))
       (:OR (execute-or cpu operands) (values next-pc cycles))
+      (:SWAP (execute-swap cpu operands) (values next-pc cycles))
+      (:XOR (execute-xor cpu operands) (values next-pc cycles))
       (:ADD (execute-add cpu mmu operands) (values next-pc cycles))
       (:ADC (execute-adc cpu mmu operands) (values next-pc cycles))
       (:CP (execute-cp cpu mmu operands) (values next-pc cycles))
@@ -667,6 +669,62 @@
           (cpu-flag cpu :h) nil
           (cpu-flag cpu :c) (= new-carry 1))))
 
+(defun execute-xor (cpu mmu operands)
+  "Execute XOR instruction"
+  (let* ((target (first operands))
+         (source (second operands))
+         (source-value 
+           (cond
+             ;; XOR with register
+             ((register-p (cdr (assoc :name source)))
+              (cpu-register cpu (cdr (assoc :name source))))
+             
+             ;; XOR with immediate value (n8)
+             ((equal (cdr (assoc :name source)) "n8")
+              (read-byte-at mmu (1+ (cpu-pc cpu))))
+             
+             ;; XOR with [HL]
+             ((and (equal (cdr (assoc :name source)) "HL")
+                   (not (cdr (assoc :immediate source))))
+              (read-byte-at mmu (get-address-from-register-pair cpu "H" "L")))
+             
+             (t (error "Unknown source for XOR instruction"))))
+         
+         ;; Calculate result (A register is always target)
+         (result (logxor (cpu-register cpu "A") source-value)))
+    
+    ;; Store result in A register
+    (setf (cpu-register cpu "A") result)
+    
+    ;; Set flags according to GB CPU manual
+    (setf (cpu-flag cpu :z) (zerop result)
+          (cpu-flag cpu :n) nil
+          (cpu-flag cpu :h) nil
+          (cpu-flag cpu :c) nil)))
+
+(defun execute-swap (cpu mmu operands)
+  "Execute SWAP instruction - swap upper and lower nibbles"
+  (let* ((target (first operands))
+         (target-name (cdr (assoc :name target)))
+         (immediate (cdr (assoc :immediate target)))
+         ;; Get value to swap either from register or memory
+         (value (if immediate
+                    (cpu-register cpu target-name)
+                    (read-byte-at mmu (get-address-from-register-pair cpu "H" "L"))))
+         ;; Swap nibbles
+         (result (logior (ash (logand value #x0F) 4)
+                         (ash (logand value #xF0) -4))))
+    
+    ;; Store result back in register or memory
+    (if immediate
+        (setf (cpu-register cpu target-name) result)
+        (write-byte-at mmu (get-address-from-register-pair cpu "H" "L") result))
+    
+    ;; Set flags
+    (setf (cpu-flag cpu :z) (zerop result)
+          (cpu-flag cpu :n) nil
+          (cpu-flag cpu :h) nil
+          (cpu-flag cpu :c) nil)))
 
 ;; Helper functions
 (defun register-p (name)

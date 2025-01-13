@@ -1,18 +1,10 @@
 (in-package :lispboy)
 
 (defstruct cycle-manager
-  (cycle-count 0 :type integer)
+  (current-cycle 0 :type integer)
   (running t :type boolean)
-  (last-frame-time (get-nanoseconds) :type integer)
-  ;; Track cycles separately for CPU and PPU
-  (cpu-cycles 0 :type integer)
-  (ppu-dots 0 :type integer)  
-  ;; Synchronization primitives
-  (frame-lock (bt:make-lock "frame-lock"))
-  (cpu-lock (bt:make-lock "cpu-lock"))
-  (cpu-condition (bt:make-condition-variable))
-  (ppu-lock (bt:make-lock "ppu-lock"))
-  (ppu-condition (bt:make-condition-variable)))
+  (cycle-lock (bt:make-lock "cycle-lock"))
+  (cycle-condition (bt:make-condition-variable :name "cycle-condition")))
 
 (defconstant +cpu-cycles-per-frame+ 70224)  ; 4194304 Hz / ~59.73 fps
 (defconstant +ppu-dots-per-frame+ 17556)    ; CPU cycles / 4
