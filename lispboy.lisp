@@ -9,7 +9,8 @@
 (defstruct gameboy 
   (cpu (make-cpu))
   (mmu (make-mmu))
-  (ppu (make-ppu-with-framebuffer)))
+  (ppu (make-ppu-with-framebuffer))
+  (clock-state (make-cycle-state)))
 
 
 (defun reset-cpu (cpu)
@@ -135,73 +136,52 @@
     (format t "~&[TIMING] ~?" format-string args)
     (finish-output)))
 
-(defun run-timing-thread (gb)
-  "Main timing thread that ticks every cycle"
-  (let ((timer (cpu-cycle-manager (gameboy-cpu gb))))
+(defun run-clock-thread (gb)
+  "Main clock thread that signals CPU/PPU at Game Boy clock speed"
+  (let* ((state (make-cycle-state))
+         (cycle-duration (/ 1.0 4194304))) ; Duration in seconds for one cycle
+    
     (loop while *emulator-running* do
-          (let ((frame-start (get-nanoseconds)))
-            ;; Reset cycle count for new frame
-            (setf (cycle-manager-current-cycle timer) 0)
-            
-            (loop while (< (cycle-manager-current-cycle timer) +cpu-cycles-per-frame+) do
-                  (let ((cycle-start (get-nanoseconds)))
-                    ;; Notify everyone about the cycle
-                    (bt:with-lock-held ((cycle-manager-cycle-lock timer))
-                      (incf (cycle-manager-current-cycle timer))
-                      (bt:condition-notify (cycle-manager-cycle-condition timer)))
-                    
-                    ;; Wait for next cycle
-                    (let* ((elapsed (- (get-nanoseconds) cycle-start))
-                           (wait-time (- +nanosecs-per-cycle+ elapsed)))
-                      (when (> wait-time 0)
-                        ;; Sleep for most of the wait time
-                        (sleep (/ wait-time 1000000000.0))))))))))
+          ;; Signal both CPU and PPU
+          (sb-thread:signal-semaphore (cycle-state-cpu-semaphore state))
+          (sb-thread:signal-semaphore (cycle-state-ppu-semaphore state))          
+          ;; Wait for next cycle
+          (sleep cycle-duration))))
 
-(defun run-cpu-loop (gb)
-  "CPU execution based on cycle ticks"
+(defun run-cpu-thread (gb)
+  "CPU thread with its own semaphore"
   (let* ((cpu (gameboy-cpu gb))
          (mmu (gameboy-mmu gb))
-         (timer (cpu-cycle-manager cpu))
+         (cycle-state (gameboy-clock-state gb))
          (cycles-needed 0))
+    
     (loop while *emulator-running* do
-          ;; Wait for next cycle
-          (bt:with-lock-held ((cycle-manager-cycle-lock timer))
-            (bt:condition-wait (cycle-manager-cycle-condition timer)
-                               (cycle-manager-cycle-lock timer)))
-          
-          ;; If we need more cycles for current instruction, just wait
-          (when (> cycles-needed 0)
-            (decf cycles-needed)
-            (when (zerop cycles-needed)
-              (handle-interrupts cpu mmu)))
-          
-          ;; Execute next instruction when we have enough cycles
-          (when (zerop cycles-needed)
-            (multiple-value-bind (next-pc cycles)
-                (execute cpu mmu (cpu-pc cpu))
-              (setf (cpu-pc cpu) next-pc
-                    cycles-needed (1- cycles)))))))
+          ;; Wait for available cycle on CPU semaphore
+          (sb-thread:wait-on-semaphore (cycle-state-cpu-semaphore cycle-state))
+          ;; Handle instruction cycles
+          (if (> cycles-needed 0)
+              (decf cycles-needed)
+              (multiple-value-bind (next-pc cycles) 
+                  (execute cpu mmu (cpu-pc cpu))
+                (setf (cpu-pc cpu) next-pc
+                      cycles-needed (1- cycles)))))))
 
-(defun run-ppu-loop (gb)
-  "PPU updates based on cycle ticks"
-  (let* ((cpu (gameboy-cpu gb))
-         (ppu (gameboy-ppu gb))
+(defun run-ppu-thread (gb)
+  "PPU thread that waits for full dots (4 cycles) at a time"
+  (let* ((ppu (gameboy-ppu gb))
          (mmu (gameboy-mmu gb))
-         (timer (cpu-cycle-manager cpu))
-         (dot-cycles 0))
+         (cycle-state (gameboy-clock-state gb)))
+    
     (loop while *emulator-running* do
-          ;; Wait for next cycle
-          (bt:with-lock-held ((cycle-manager-cycle-lock timer))
-            (bt:condition-wait (cycle-manager-cycle-condition timer)
-                               (cycle-manager-cycle-lock timer)))
-          
-          ;; Count cycles until we have 4 (1 PPU dot)
-          (incf dot-cycles)
-          (when (>= dot-cycles 4)
-            (setf dot-cycles 0)
-            ;; Update PPU state for this dot
-            (update-ppu-state ppu mmu 
-                              (floor (cycle-manager-current-cycle timer) 4))))))
+          ;; Process each scanline
+          (dotimes (scanline 154)  ; 144 visible + 10 vblank
+            (dotimes (dot 456)
+              ;; Wait for 4 cycles that make up this dot
+              (dotimes (i 4)
+                (sb-thread:wait-on-semaphore (cycle-state-ppu-semaphore cycle-state)))
+              
+              ;; Update PPU state with current scanline and dot
+              (update-ppu-state ppu mmu scanline dot))))))
 
 (defun dummy-thread (gb))
 (defun emulator-main (gb)
@@ -213,10 +193,10 @@
                (texture (sdl2:create-texture renderer :rgb888 :streaming 
                                              +screen-width+ +screen-height+))
                (timing-thread (bt:make-thread 
-                               (lambda () (run-timing-thread gb))
+                               (lambda () (run-clock-thread gb))
                                :name "timing-thread"))
-               (display-thread (bt:make-thread (lambda () (run-ppu-loop gb)) :name "display-thread"))
-               (cpu-thread (bt:make-thread (lambda () (run-cpu-loop gb)) :name "cpu-thread")))
+               (display-thread (bt:make-thread (lambda () (run-ppu-thread gb)) :name "display-thread"))
+               (cpu-thread (bt:make-thread (lambda () (run-cpu-thread gb)) :name "cpu-thread")))
 
           (sdl2:with-event-loop (:method :poll)
             (:keyup

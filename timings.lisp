@@ -23,6 +23,11 @@
 (defconstant +serial-int+ #x08)
 (defconstant +joypad-int+ #x10)
 
+(defstruct cycle-state
+  (cpu-semaphore (sb-thread:make-semaphore :count 0))
+  (ppu-semaphore (sb-thread:make-semaphore :count 0)))
+
+
 (defun handle-interrupts (cpu mmu)
   "Check and handle any pending interrupts"
   (when (cpu-ime cpu)  ; Only handle interrupts if IME is set

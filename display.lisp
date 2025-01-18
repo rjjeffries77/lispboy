@@ -250,45 +250,35 @@
   "Check if LCD display is enabled (bit 7 of LCDC)"
   (lcdc-flag-set-p ppu +lcdc-display-enable+))
 
-(defun update-ppu-state (ppu mmu current-dots)
-  "Update PPU state based on current dot count"
-  (let* ((scanline (ppu-ly ppu))
-         (line-dots (mod current-dots +scanline-cycles+))
-         (old-mode (ppu-mode ppu)))
+(defun update-ppu-state (ppu mmu scanline dot)
+  "Update PPU state based on current scanline and dot position"
+  (let ((old-mode (ppu-mode ppu)))
     
-    ;; Handle scanline increment first, independent of mode
-    (when (= line-dots 0)
-      (incf (ppu-ly ppu))
-      (write-memory mmu #xFF44 (ppu-ly ppu))
-      
-      ;; Check if we should wrap back to start
-      (when (> (ppu-ly ppu) +vblank-end+)
-        (setf (ppu-ly ppu) 0)
-        (write-memory mmu #xFF44 0))
-      
-      ;; Reset window line counter at start of frame
-      (when (zerop (ppu-ly ppu))
-        (setf (ppu-window-line ppu) 0)))
+    ;; Update mode based on dot position in scanline
+    (setf (ppu-mode ppu)
+          (cond 
+            ((>= scanline +vblank-start+) 1)  ; VBlank
+            ((<= dot +mode-2-cycles+) 2)      ; OAM Search
+            ((<= dot (+ +mode-2-cycles+ +mode-3-cycles+)) 3) ; Pixel Transfer
+            (t 0)))                           ; H-Blank
 
-    
-    ;; Update mode based on current state
-    (let ((new-mode (cond 
-                      ((<= line-dots +mode-2-cycles+) 2) ; OAM Search
-                      ((<= line-dots (+ +mode-2-cycles+ +mode-3-cycles+)) 3) ; Pixel Transfer
-                      (t 0)))) ; H-Blank
-      
-      (setf (ppu-mode ppu) new-mode)
-  
-    
     ;; Handle mode transitions
     (when (/= old-mode (ppu-mode ppu))
       (case (ppu-mode ppu)
         (0  ; Entering H-Blank
          (when (lcdc-display-enabled-p ppu)
-           (render-scanline ppu mmu (ppu-ly ppu))))
-        
+           (format t "Entering H-Blank")
+           (render-scanline ppu mmu scanline)))
         (1  ; Entering V-Blank
-         (when (= (ppu-ly ppu) +vblank-start+)
-           (request-vblank-interrupt mmu)))))
+         (when (= scanline +vblank-start+)
+           (format t "Requesting vblank interrupt")
+           (request-vblank-interrupt mmu)))
+        (2  ; Starting new scanline
+         (when (zerop dot)
+           (write-memory mmu #xFF44 scanline)
+           (format t "PPU LY updated to ~A~%" scanline)
+           ;; Reset window line counter at start of frame
+           (when (zerop scanline)
+             (setf (ppu-window-line ppu) 0))))))
     
-    (update-stat-register ppu mmu))))
+    (update-stat-register ppu mmu)))
