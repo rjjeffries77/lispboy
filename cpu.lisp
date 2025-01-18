@@ -6,7 +6,6 @@
            collect `(,reg 0 :type (unsigned-byte 8)))
            (PC 0 :type (unsigned-byte 16))
            (SP 0 :type (unsigned-byte 16))
-           (cycle-manager (make-cycle-manager))
            (ime nil :type boolean)))
 
 (defcpu cpu (A B C D E F H L))
@@ -88,8 +87,8 @@
          (operands (get-operands opcode)))
     
     ;; Debug output
-    (let ((instruction-text (disassemble-instruction mmu pc)))
-      (format t "~4,'0X: ~A~%" pc instruction-text))
+   ;
+
     (execute-instruction cpu mmu opcode operands)))
 
 (defun execute-instruction (cpu mmu opcode operands)

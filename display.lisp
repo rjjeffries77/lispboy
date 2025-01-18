@@ -12,6 +12,19 @@
 (defconstant +color-light+ #x8BAC0F)
 (defconstant +color-lightest+ #x9BBC0F)
 
+(defconstant +color-map+ (vector +color-lightest+  ; Lightest (off) - GameBoy green
+                           +color-light+  ; Light
+                           +color-dark+   ; Dark
+                           +color-darkest+)) ; Darkest (on)
+
+;; Sprite flags
+(defconstant +sprite-priority+ #x80)  ; 0=Above BG, 1=Behind BG
+(defconstant +sprite-y-flip+ #x40)    ; Vertical flip
+(defconstant +sprite-x-flip+ #x20)    ; Horizontal flip
+(defconstant +sprite-palette+ #x10)   ; 0=OBP0, 1=OBP1
+
+(defstruct sprite
+  x y tile-num attributes)
 (defconstant +lcdc-display-enable+ #x80)
 (defconstant +lcdc-window-tile-map+ #x40)
 (defconstant +lcdc-window-enable+ #x20)
@@ -40,6 +53,22 @@
 (cffi:defcstruct framebuffer-array
   (pixels :uint32 :count 23040))
 
+
+(defstruct fetcher
+  "Pixel fetcher state"
+  (state :get-tile)        ; Current state of fetch
+  tile-number              ; Current tile number
+  tile-data-low           ; Low byte of tile data
+  tile-data-high          ; High byte of tile data
+  (fifo (make-fifo))      ; Pixel FIFO
+  (x 0)                     ; Current X position
+  (pushed 0))             ; Number of pixels pushed to FIFO
+
+(defstruct fifo
+  (data (make-array 8 :initial-element 0))
+  (head 0)
+  (size 0))
+
 (defstruct ppu
   (lcdc 0 :type (unsigned-byte 8))
   (stat 0 :type (unsigned-byte 8))
@@ -54,6 +83,9 @@
   (wy 0 :type (unsigned-byte 8))
   (mode 2 :type (integer 0 3))
   (window-line 0 :type integer)
+  (bg-fifo (make-fifo))
+  (sprite-fifo (make-fifo))
+  (fetcher (make-fetcher))
   (framebuffer (cffi:null-pointer) :type cffi:foreign-pointer))
 
 (defun make-ppu-with-framebuffer ()
@@ -69,6 +101,55 @@
 (defconstant +nintendo-logo-width+ 12)
 (defconstant +nintendo-logo-height+ 8)
 (defconstant +boot-scroll-steps+ 8)
+;; Nintendo Logo tile data (stored in ROM at $0104-$0133)
+
+(defconstant +nintendo-logo-data+
+  #(#xCE #xED #x66 #x66 #xCC #x0D #x00 #x0B #x03 #x73 #x00 #x83 #x00 #x0C #x00 #x0D
+    #x00 #x08 #x11 #x1F #x88 #x89 #x00 #x0E #xDC #xCC #x6E #xE6 #xDD #xDD #xD9 #x99
+    #xBB #xBB #x67 #x63 #x6E #x0E #xEC #xCC #xDD #xDC #x99 #x9F #xBB #xB9 #x33 #x3E))
+
+(defun init-nintendo-logo (mmu)
+  "Initialize VRAM with Nintendo logo data"
+  ;; Set up the tiles - each tile is 16 bytes (8x8 pixels, 2bpp)
+  ;; The logo data starts at $0104 in ROM and we'll copy it to the first tile pattern in VRAM
+  (loop for i from 0 below (length +nintendo-logo-data+)
+        do (write-memory mmu (+ #x8010 i) (aref +nintendo-logo-data+ i)))
+  
+  ;; Set up the tile map - the logo uses tiles 1-19
+  ;; We'll place it at $9904 (near top of background map)
+  (loop for i from 0 below 19
+        do (write-memory mmu (+ #x9904 i) (1+ i)))
+
+  ;; Now set up PPU registers for correct display
+  ;; LCDC - Enable LCD and BG
+  (write-memory mmu #xFF40 #x91)  ; LCD on, BG on, Rest off
+  ;; BGP - Normal palette
+  (write-memory mmu #xFF47 #xFC)  ; 11111100 - Normal colors
+  ;; Scroll registers to center the logo
+  (write-memory mmu #xFF42 48)    ; SCY - Vertical scroll
+  (write-memory mmu #xFF43 44))   ; SCX - Horizontal scroll
+
+(defun fifo-push (fifo value)
+  (when (< (fifo-size fifo) 8)
+    (let ((pos (mod (+ (fifo-head fifo) (fifo-size fifo)) 8)))
+      (setf (aref (fifo-data fifo) pos) value)
+      (incf (fifo-size fifo)))))
+
+(defun fifo-pop (fifo)
+  (when (> (fifo-size fifo) 0)
+    (let ((value (aref (fifo-data fifo) (fifo-head fifo))))
+      (setf (fifo-head fifo) (mod (1+ (fifo-head fifo)) 8))
+      (decf (fifo-size fifo))
+      value)))
+
+(defun fifo-clear (fifo)
+  (setf (fifo-head fifo) 0
+        (fifo-size fifo) 0))
+
+(defun get-color (palette color-num)
+  "Convert 2-bit color through palette to final color"
+  (aref +color-map+ 
+        (logand (ash palette (- (* color-num 2))) #x3)))
 
 ;; Helper function to set pixel in foreign framebuffer
 (defun set-pixel (ppu x y color)
@@ -77,115 +158,6 @@
     (setf (cffi:mem-aref (ppu-framebuffer ppu) :uint32 
                          (+ (* y +screen-width+) x))
           color)))
-
-(defun render-scanline (ppu mmu ly)
-  "Draw a complete scanline"
-  (when (not (zerop (logand (ppu-lcdc ppu) +lcdc-display-enable+)))
-    ;; Draw background
-    (when (not (zerop (logand (ppu-lcdc ppu) +lcdc-bg-enable+)))
-      (draw-background-scanline ppu mmu ly))
-    
-    ;; Draw window
-    (when (and (not (zerop (logand (ppu-lcdc ppu) +lcdc-window-enable+)))
-               (>= ly (ppu-wy ppu)))
-      (draw-window-scanline ppu mmu ly))
-    
-    ;; Draw sprites
-    (when (not (zerop (logand (ppu-lcdc ppu) +lcdc-obj-enable+)))
-      (draw-sprites-scanline ppu mmu ly))))
-
-(defun draw-background-scanline (ppu mmu ly)
-  "Draw a single background scanline"
-  (let* ((lcdc (ppu-lcdc ppu))
-         (scx (ppu-scx ppu))
-         (scy (ppu-scy ppu))
-         ;; Select tile data area based on LCDC bit 4
-         (tile-data-base (if (zerop (logand lcdc +lcdc-bg-tile-data+))
-                            #x8800  ; $8800-97FF, signed addressing
-                            #x8000)) ; $8000-8FFF
-         ;; Select tile map area based on LCDC bit 3
-         (tile-map-base (if (zerop (logand lcdc +lcdc-bg-tile-map+))
-                           #x9800   ; $9800-9BFF
-                           #x9C00)) ; $9C00-9FFF
-         ;; Adjust y position for scrolling
-         (y (mod (+ ly scy) 256))
-         ;; Which row of tiles to use in the map
-         (tile-row (floor y 8))
-         ;; Which line within the tiles to use
-         (tile-line (mod y 8))
-         ;; Pre-calculate y offset into tile data
-         (tile-line-offset (* tile-line 2)))
-    
-    ;; Draw all pixels in the scanline
-    (loop for screen-x from 0 below +screen-width+
-          do (let* ((x (mod (+ screen-x scx) 256))
-                    (tile-col (floor x 8))
-                    (pixel-x (mod x 8))
-                    ;; Get the tile number from the map
-                    (map-addr (+ tile-map-base 
-                                (+ (* tile-row 32) 
-                                   tile-col)))
-                    (tile-num (read-memory mmu map-addr))
-                    ;; Calculate tile data address
-                    (tile-addr (if (zerop (logand lcdc +lcdc-bg-tile-data+))
-                                 ;; Signed addressing mode
-                                 (+ tile-data-base 
-                                    (* (if (> tile-num 127)
-                                         (- tile-num 256)
-                                         tile-num)
-                                       16))
-                                 ;; Unsigned addressing mode
-                                 (+ tile-data-base (* tile-num 16))))
-                    ;; Get the two bytes that define the line of pixels
-                    (byte1 (read-memory mmu (+ tile-addr tile-line-offset)))
-                    (byte2 (read-memory mmu (+ tile-addr tile-line-offset 1)))
-                    ;; Extract the color value for this pixel
-                    (color-bit (- 7 pixel-x))
-                    (color-num (logior
-                               (ash (logand (ash byte2 (- color-bit)) 1) 1)
-                               (logand (ash byte1 (- color-bit)) 1)))
-                    ;; Convert the 2-bit color to actual RGB using BGP register
-                    (palette-color (logand (ash (ppu-bgp ppu) 
-                                              (* -2 color-num))
-                                         #x3))
-                    ;; Map to actual color
-                    (color (case palette-color
-                            (0 +color-lightest+)
-                            (1 +color-light+)
-                            (2 +color-dark+)
-                            (3 +color-darkest+))))
-               ;; Set the pixel using the new set-pixel function
-               (set-pixel ppu screen-x ly color)))))
-
-;; Placeholder functions for window and sprite drawing
-(defun draw-window-scanline (ppu mmu ly)
-  "Draw window tiles for current scanline"
-  ;; Window drawing implementation here
-  nil)
-
-(defun draw-sprites-scanline (ppu mmu ly)
-  "Draw sprites for current scanline"
-  ;; Sprite drawing implementation here
-  nil)
-
-(defun init-nintendo-logo (ppu mmu)
-  "Initialize PPU with Nintendo logo data"
-  ;; The logo data should already be in ROM from address $0104-$0133
-  ;; We need to copy it to VRAM tile data starting at tile 1 ($8010)
-  (loop for i from 0 below #x30
-        do (write-memory mmu (+ #x8010 i)
-                        (read-memory mmu (+ #x0104 i))))
-  
-  ;; Set up background map to display logo at $9904
-  (loop for i from 0 below 19
-        do (write-memory mmu (+ #x9904 i) (1+ i)))
-  
-  ;; Initialize PPU registers
-  (setf (ppu-lcdc ppu) (logior +lcdc-display-enable+
-                               +lcdc-bg-enable+))
-  (setf (ppu-bgp ppu) #xFC)  ; 11111100 - Normal palette
-  (setf (ppu-scx ppu) 44)    ; Center horizontally
-  (setf (ppu-scy ppu) 48))
 
 (defun request-vblank-interrupt (mmu)
   "Request VBlank interrupt through MMU"
@@ -266,9 +238,8 @@
     (when (/= old-mode (ppu-mode ppu))
       (case (ppu-mode ppu)
         (0  ; Entering H-Blank
-         (when (lcdc-display-enabled-p ppu)
-           (format t "Entering H-Blank")
-           (render-scanline ppu mmu scanline)))
+         (fifo-clear (ppu-bg-fifo ppu))
+         (fifo-clear (ppu-sprite-fifo ppu)))
         (1  ; Entering V-Blank
          (when (= scanline +vblank-start+)
            (format t "Requesting vblank interrupt")
@@ -276,9 +247,87 @@
         (2  ; Starting new scanline
          (when (zerop dot)
            (write-memory mmu #xFF44 scanline)
-           (format t "PPU LY updated to ~A~%" scanline)
            ;; Reset window line counter at start of frame
            (when (zerop scanline)
              (setf (ppu-window-line ppu) 0))))))
+
+    ;; Mode 3
+    (when (= (ppu-mode ppu) 3)
+      (let* ((x (- dot +mode-2-cycles+)) ; Current x position relative to start of Mode 3
+             (fetcher (ppu-fetcher ppu)))
+        
+        ;; Update fetcher state
+        (case (fetcher-state fetcher)
+          (:get-tile
+           ;; Get tile number from tile map
+           (let* ((lcdc (ppu-lcdc ppu))
+                  (map-base (if (zerop (logand lcdc #x08))
+                                #x9800 #x9C00))
+                  (tile-y (floor (/ (+ scanline (ppu-scy ppu)) 8)))
+                  (tile-x (floor (/ (+ (fetcher-x fetcher) (ppu-scx ppu)) 8)))
+                  (map-addr (+ map-base (* 32 (mod tile-y 32)) (mod tile-x 32))))
+             (setf (fetcher-tile-number fetcher) 
+                   (read-memory mmu map-addr))
+             (setf (fetcher-state fetcher) :get-tile-data-low)))
+          
+          (:get-tile-data-low
+           ;; Get low byte of tile data
+           (let* ((lcdc (ppu-lcdc ppu))
+                  (tile-base (if (zerop (logand lcdc #x10))
+                                 #x8800 #x8000))
+                  (tile-num (fetcher-tile-number fetcher))
+                  (fine-y (mod (+ scanline (ppu-scy ppu)) 8))
+                  (tile-addr (if (= tile-base #x8800)
+                                 (+ tile-base (* (if (> tile-num 127)
+                                                     (- tile-num 256)
+                                                     tile-num)
+                                                 16))
+                                 (+ tile-base (* tile-num 16))))
+                  (data-addr (+ tile-addr (* fine-y 2))))
+             (setf (fetcher-tile-data-low fetcher)
+                   (read-memory mmu data-addr))
+             (setf (fetcher-state fetcher) :get-tile-data-high)))
+          
+          (:get-tile-data-high
+           ;; Get high byte of tile data
+           (let* ((lcdc (ppu-lcdc ppu))
+                  (tile-base (if (zerop (logand lcdc #x10))
+                                 #x8800 #x8000))
+                  (tile-num (fetcher-tile-number fetcher))
+                  (fine-y (mod (+ scanline (ppu-scy ppu)) 8))
+                  (tile-addr (if (= tile-base #x8800)
+                                 (+ tile-base (* (if (> tile-num 127)
+                                                     (- tile-num 256)
+                                                     tile-num)
+                                                 16))
+                                 (+ tile-base (* tile-num 16))))
+                  (data-addr (+ tile-addr (* fine-y 2) 1)))
+             (setf (fetcher-tile-data-high fetcher)
+                   (read-memory mmu data-addr))
+             (setf (fetcher-state fetcher) :push-to-fifo)))
+          
+          (:push-to-fifo
+           ;; Push pixels to FIFO if it has space
+           (when (< (fifo-size (ppu-bg-fifo ppu)) 8)
+             (let ((low (fetcher-tile-data-low fetcher))
+                   (high (fetcher-tile-data-high fetcher)))
+               ;; Push 8 pixels to FIFO
+               (dotimes (i 8)
+                 (let* ((bit (- 7 i))
+                        (color-low (logand (ash low (- bit)) 1))
+                        (color-high (ash (logand (ash high (- bit)) 1) 1))
+                        (color-num (logior color-high color-low)))
+                   (fifo-push (ppu-bg-fifo ppu)
+                              (get-color (ppu-bgp ppu) color-num))))
+               ;; Move to next tile
+               (incf (fetcher-x fetcher) 8)
+               (setf (fetcher-state fetcher) :get-tile)))))
+        
+        ;; Output pixel if we have one in the FIFO
+        (when (and (>= x 0) (< x +screen-width+))
+          (let ((color (fifo-pop (ppu-bg-fifo ppu))))
+            (when color
+              (set-pixel ppu x scanline color))))))
     
+    ;; Update STAT register
     (update-stat-register ppu mmu)))

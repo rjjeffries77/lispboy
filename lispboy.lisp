@@ -31,10 +31,7 @@
   
   ;; Reset interrupt flag
   (setf (cpu-ime cpu) nil)   ; IME starts disabled
-  
-  ;; Reset cycle manager
-  (setf (cpu-cycle-manager cpu) (make-cycle-manager))
-  
+ 
   cpu) ; Return the reset CPU
 
 ;; Example usage to reset the whole system:
@@ -189,6 +186,7 @@
     (sdl2:with-window (win :title "LISPBOY" :w 800 :h 600)
       (sdl2:with-renderer (renderer win)
         ;; Start game logic thread
+        (init-nintendo-logo (gameboy-mmu gb))
         (let* ((ppu (gameboy-ppu gb))
                (texture (sdl2:create-texture renderer :rgb888 :streaming 
                                              +screen-width+ +screen-height+))
@@ -224,7 +222,7 @@
       (format t "~%Starting CPU test ROM execution...~%")
       (finish-output)
       (handler-case
-          (load-cartridge a-gameboy (merge-pathnames #P"./roms/snake.gb" source-dir))
+          (load-cartridge a-gameboy (merge-pathnames #P"./roms/cpu_instrs.gb" source-dir))
         (error (c)
           (format t "~%Error occurred: ~A~%" c)
           (finish-output)))))

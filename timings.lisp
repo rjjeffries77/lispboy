@@ -1,11 +1,5 @@
 (in-package :lispboy)
 
-(defstruct cycle-manager
-  (current-cycle 0 :type integer)
-  (running t :type boolean)
-  (cycle-lock (bt:make-lock "cycle-lock"))
-  (cycle-condition (bt:make-condition-variable :name "cycle-condition")))
-
 (defconstant +cpu-cycles-per-frame+ 70224)  ; 4194304 Hz / ~59.73 fps
 (defconstant +ppu-dots-per-frame+ 17556)    ; CPU cycles / 4
 (defconstant +target-frame-time+ (floor (* 1000000000 (/ 1.0 59.73))))
@@ -65,22 +59,6 @@
         (logand (mmu-if mmu) (lognot int-bit)))
   (push-word cpu mmu (cpu-pc cpu))
   (setf (cpu-pc cpu) vector))
-
-(defun wait-for-next-frame (timer)
-  "Wait until it's time for the next frame"
-  (let* ((current-time (get-nanoseconds))
-         (target-time (+ (frame-timer-last-frame-time timer) 
-                         +nanoseconds-per-frame+)))
-    (when (< current-time target-time)
-      ;; Sleep for most of the remaining time
-      (let ((sleep-ns (- target-time current-time 100000))) ; Leave 100μs for precision
-        (when (> sleep-ns 0)
-          (sleep (/ sleep-ns 1000000000.0))))
-      ;; Spin-wait for the remainder
-      (loop while (< (get-nanoseconds) target-time)))
-    (setf (frame-timer-last-frame-time timer) target-time)
-    (incf (frame-timer-frame-count timer))
-    (setf (frame-timer-cycles-this-frame timer) 0)))
 
 (defun print-timing-stats (timer)
   (let* ((elapsed-ns (- (get-nanoseconds) 
