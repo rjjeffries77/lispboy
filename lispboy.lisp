@@ -138,7 +138,7 @@
 
 (defun run-clock-thread (gb)
   "Main clock thread that signals CPU/PPU at Game Boy clock speed"
-  (let* ((state (make-cycle-state))
+  (let* ((state (gameboy-clock-state gb))
          (cycle-duration (/ 1.0 4194304))) ; Duration in seconds for one cycle
     
     (loop while *emulator-running* do
