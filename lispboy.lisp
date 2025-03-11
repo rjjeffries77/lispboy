@@ -163,7 +163,7 @@
                 (setf (cpu-pc cpu) next-pc
                       cycles-needed (1- cycles)))))))
 
-(defun run-ppu-thread (gb)
+(Defun run-ppu-thread (gb)
   "PPU thread that waits for full dots (4 cycles) at a time"
   (let* ((ppu (gameboy-ppu gb))
          (mmu (gameboy-mmu gb))
@@ -172,13 +172,14 @@
     (loop while *emulator-running* do
           ;; Process each scanline
           (dotimes (scanline 154)  ; 144 visible + 10 vblank
-            (dotimes (dot 456)
+            (dotimes (dot 456) ; 160 dots + vblank
               ;; Wait for 4 cycles that make up this dot
               (dotimes (i 4)
                 (sb-thread:wait-on-semaphore (cycle-state-ppu-semaphore cycle-state)))
               
               ;; Update PPU state with current scanline and dot
               (update-ppu-state ppu mmu scanline dot))))))
+              
 
 (defun dummy-thread (gb))
 (defun emulator-main (gb)

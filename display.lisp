@@ -1,5 +1,6 @@
 
 (in-package :lispboy)
+(declaim (optimize (speed 3) (safety 0)))
 
 (defconstant +screen-width+ 160)
 (defconstant +screen-height+ 144)
@@ -37,9 +38,9 @@
 ;; PPU timing constants
 (defconstant +vblank-start+ 144)    ; First VBlank line
 (defconstant +vblank-end+ 153)  
-(defconstant +mode-2-cycles+ 80)    ; OAM search - 80 cycles
-(defconstant +mode-3-cycles+ 172)   ; Pixel transfer - 172-289 cycles
-(defconstant +mode-0-cycles+ 208)   ; H-Blank - 87-204 cycles
+(defconstant +oam-search-cycles+ 80)    ; OAM search - 80 cycles
+(defconstant +hblank-cycles+ 43)   ; Pixel transfer - 172-289 cycles
+(defconstant +vblank-cycles+ 1140)   ; H-Blank - 87-204 cycles
 (defconstant +scanline-cycles+ 456) ; Total cycles per scanline
 (defconstant +vblank-scanlines+ 10) ; Number of V-Blank scanlines
 
@@ -53,6 +54,9 @@
 (cffi:defcstruct framebuffer-array
   (pixels :uint32 :count 23040))
 
+(defstruct pixel
+  x
+  colour)
 
 (defstruct fetcher
   "Pixel fetcher state"
@@ -60,7 +64,6 @@
   tile-number              ; Current tile number
   tile-data-low           ; Low byte of tile data
   tile-data-high          ; High byte of tile data
-  (fifo (make-fifo))      ; Pixel FIFO
   (x 0)                     ; Current X position
   (pushed 0))             ; Number of pixels pushed to FIFO
 
@@ -86,6 +89,7 @@
   (bg-fifo (make-fifo))
   (sprite-fifo (make-fifo))
   (fetcher (make-fetcher))
+  (phase :h-blank)
   (framebuffer (cffi:null-pointer) :type cffi:foreign-pointer))
 
 (defun make-ppu-with-framebuffer ()
@@ -111,25 +115,23 @@
 (defun init-nintendo-logo (mmu)
   "Initialize VRAM with Nintendo logo data"
   ;; Set up the tiles - each tile is 16 bytes (8x8 pixels, 2bpp)
-  ;; The logo data starts at $0104 in ROM and we'll copy it to the first tile pattern in VRAM
   (loop for i from 0 below (length +nintendo-logo-data+)
-        do (write-memory mmu (+ #x8010 i) (aref +nintendo-logo-data+ i)))
+        do (write-memory mmu (+ #x8000 i) (aref +nintendo-logo-data+ i)))
   
-  ;; Set up the tile map - the logo uses tiles 1-19
-  ;; We'll place it at $9904 (near top of background map)
-  (loop for i from 0 below 19
-        do (write-memory mmu (+ #x9904 i) (1+ i)))
+  ;; Set up the tile map
+  (loop for y from 0 below 2
+        do (loop for x from 0 below +nintendo-logo-width+
+                 do (write-memory mmu 
+                                  (+ #x9904 x (* y 32))
+                                  (+ (* y +nintendo-logo-width+) x))))
+  
+  ;; Set PPU registers
+  (write-memory mmu #xFF40 #x91)  ; LCD on, BG/window tilemap 0, BG on
+  (write-memory mmu #xFF42 0)     ; SCY = 0
+  (write-memory mmu #xFF43 0)     ; SCX = 0
+  (write-memory mmu #xFF47 #xE4)) ; 
 
-  ;; Now set up PPU registers for correct display
-  ;; LCDC - Enable LCD and BG
-  (write-memory mmu #xFF40 #x91)  ; LCD on, BG on, Rest off
-  ;; BGP - Normal palette
-  (write-memory mmu #xFF47 #xFC)  ; 11111100 - Normal colors
-  ;; Scroll registers to center the logo
-  (write-memory mmu #xFF42 48)    ; SCY - Vertical scroll
-  (write-memory mmu #xFF43 44))   ; SCX - Horizontal scroll
-
-(defun fifo-push (fifo value)
+(Defun fifo-push (fifo value)
   (when (< (fifo-size fifo) 8)
     (let ((pos (mod (+ (fifo-head fifo) (fifo-size fifo)) 8)))
       (setf (aref (fifo-data fifo) pos) value)
@@ -139,8 +141,7 @@
   (when (> (fifo-size fifo) 0)
     (let ((value (aref (fifo-data fifo) (fifo-head fifo))))
       (setf (fifo-head fifo) (mod (1+ (fifo-head fifo)) 8))
-      (decf (fifo-size fifo))
-      value)))
+      (decf (fifo-size fifo)) value)))
 
 (defun fifo-clear (fifo)
   (setf (fifo-head fifo) 0
@@ -153,11 +154,18 @@
 
 ;; Helper function to set pixel in foreign framebuffer
 (defun set-pixel (ppu x y color)
+  "Draw a pixel to the framebuffer"
   (when (and (>= x 0) (< x +screen-width+)
              (>= y 0) (< y +screen-height+))
     (setf (cffi:mem-aref (ppu-framebuffer ppu) :uint32 
                          (+ (* y +screen-width+) x))
           color)))
+
+(defun log-fetcher-state (fetcher)
+  (format t "Fetcher state: ~A at x=~A pushed=~A~%" 
+          (fetcher-state fetcher)
+          (fetcher-x fetcher)
+          (fetcher-pushed fetcher)))
 
 (defun request-vblank-interrupt (mmu)
   "Request VBlank interrupt through MMU"
@@ -222,112 +230,111 @@
   "Check if LCD display is enabled (bit 7 of LCDC)"
   (lcdc-flag-set-p ppu +lcdc-display-enable+))
 
-(defun update-ppu-state (ppu mmu scanline dot)
-  "Update PPU state based on current scanline and dot position"
-  (let ((old-mode (ppu-mode ppu)))
-    
-    ;; Update mode based on dot position in scanline
-    (setf (ppu-mode ppu)
-          (cond 
-            ((>= scanline +vblank-start+) 1)  ; VBlank
-            ((<= dot +mode-2-cycles+) 2)      ; OAM Search
-            ((<= dot (+ +mode-2-cycles+ +mode-3-cycles+)) 3) ; Pixel Transfer
-            (t 0)))                           ; H-Blank
 
-    ;; Handle mode transitions
-    (when (/= old-mode (ppu-mode ppu))
-      (case (ppu-mode ppu)
-        (0  ; Entering H-Blank
+(defun get-tile-number (ppu mmu scanline fetcher)
+  (let* ((map-base (if (lcdc-flag-set-p ppu +lcdc-bg-tile-map+)
+                       #x9C00 #x9800))
+         (tile-y (floor (/ (+ scanline (ppu-scy ppu)) 8)))
+         (tile-x (floor (/ (+ (fetcher-x fetcher) (ppu-scx ppu)) 8)))
+         (map-addr (+ map-base 
+                      (mod (* 32 tile-y) #x400) 
+                      (mod tile-x 32))))
+    (read-memory mmu map-addr)))
+
+(Defun get-tile-data-address (ppu tile-num)
+  (let* ((tile-base (if (lcdc-flag-set-p ppu +lcdc-bg-tile-data+)
+                        #x8000 #x8800))
+         (signed-tile-num (if (= tile-base #x8800)
+                              (if (> tile-num 127)
+                                  (- tile-num 256)
+                                  tile-num)
+                              tile-num)))
+    (+ tile-base (* signed-tile-num 16))))
+
+(defun fetch-tile-data (ppu mmu scanline tile-num)
+  "Fetch the two bytes for current scanline row of tile"
+  (let* ((tile-addr (get-tile-data-address ppu tile-num))
+         (row (mod (+ scanline (ppu-scy ppu)) 8))
+         (row-addr (+ tile-addr (* row 2))))
+    (values (read-memory mmu row-addr)
+            (read-memory mmu (1+ row-addr)))))
+
+
+(defun push-pixels-to-fifo (ppu fetcher)
+  "Push next pixel from current tile data to FIFO"
+  (when (>= (- 16 (fifo-size (ppu-bg-fifo ppu))) 8) ; Check for enough room *before* pushing a tile
+    (loop for i from 0 below 8 do  ; Push all 8 pixels of the tile
+          (let* ((bit (- 7 i)) ; Simplified bit calculation
+                 (color-low (logand (ash (fetcher-tile-data-low fetcher) (- bit)) 1))
+                 (color-high (ash (logand (ash (fetcher-tile-data-high fetcher) (- bit)) 1) 1))
+                 (color-num (logior color-high color-low)))
+            (fifo-push (ppu-bg-fifo ppu)
+                       (make-pixel :x (fetcher-x fetcher)
+                                   :colour (get-color (ppu-bgp ppu) color-num))))
+          (incf (fetcher-x fetcher)))
+
+    (setf (fetcher-state fetcher) :get-tile))) ; Move to the next tile *after* pushing all 8 pixels
+
+(Defun update-ppu-state (ppu mmu scanline ppu-cycle)
+  "Update PPU state based on current scanline and dot position"
+  (when (< scanline +vblank-start+)
+            (case (ppu-phase ppu)
+      (:oam-search
+       (when (zerop ppu-cycle)
+         (setf (mmu-oam-lock mmu) t)
+         (write-memory mmu #xFF44 scanline)
+         ;; Reset fetcher state at start of each scanline
+         (let ((fetcher (ppu-fetcher ppu)))
+           (setf (fetcher-state fetcher) :get-tile
+                 (fetcher-x fetcher) 0
+                 (fetcher-pushed fetcher) 0))
          (fifo-clear (ppu-bg-fifo ppu))
          (fifo-clear (ppu-sprite-fifo ppu)))
-        (1  ; Entering V-Blank
-         (when (= scanline +vblank-start+)
-           (format t "Requesting vblank interrupt")
-           (request-vblank-interrupt mmu)))
-        (2  ; Starting new scanline
-         (when (zerop dot)
-           (write-memory mmu #xFF44 scanline)
-           ;; Reset window line counter at start of frame
-           (when (zerop scanline)
-             (setf (ppu-window-line ppu) 0))))))
+         ;; Reset window line counter at start of frame
+       (when (zerop scanline)
+         (setf (ppu-window-line ppu) 0))
+       (when (>= ppu-cycle +oam-search-cycles+); Use ppu-cycle for timing
+         (setf (ppu-phase ppu) :pixel-transfer)))
 
-    ;; Mode 3
-    (when (= (ppu-mode ppu) 3)
-      (let* ((x (- dot +mode-2-cycles+)) ; Current x position relative to start of Mode 3
-             (fetcher (ppu-fetcher ppu)))
-        
-        ;; Update fetcher state
-        (case (fetcher-state fetcher)
-          (:get-tile
-           ;; Get tile number from tile map
-           (let* ((lcdc (ppu-lcdc ppu))
-                  (map-base (if (zerop (logand lcdc #x08))
-                                #x9800 #x9C00))
-                  (tile-y (floor (/ (+ scanline (ppu-scy ppu)) 8)))
-                  (tile-x (floor (/ (+ (fetcher-x fetcher) (ppu-scx ppu)) 8)))
-                  (map-addr (+ map-base (* 32 (mod tile-y 32)) (mod tile-x 32))))
-             (setf (fetcher-tile-number fetcher) 
-                   (read-memory mmu map-addr))
-             (setf (fetcher-state fetcher) :get-tile-data-low)))
-          
-          (:get-tile-data-low
-           ;; Get low byte of tile data
-           (let* ((lcdc (ppu-lcdc ppu))
-                  (tile-base (if (zerop (logand lcdc #x10))
-                                 #x8800 #x8000))
-                  (tile-num (fetcher-tile-number fetcher))
-                  (fine-y (mod (+ scanline (ppu-scy ppu)) 8))
-                  (tile-addr (if (= tile-base #x8800)
-                                 (+ tile-base (* (if (> tile-num 127)
-                                                     (- tile-num 256)
-                                                     tile-num)
-                                                 16))
-                                 (+ tile-base (* tile-num 16))))
-                  (data-addr (+ tile-addr (* fine-y 2))))
-             (setf (fetcher-tile-data-low fetcher)
-                   (read-memory mmu data-addr))
-             (setf (fetcher-state fetcher) :get-tile-data-high)))
-          
-          (:get-tile-data-high
-           ;; Get high byte of tile data
-           (let* ((lcdc (ppu-lcdc ppu))
-                  (tile-base (if (zerop (logand lcdc #x10))
-                                 #x8800 #x8000))
-                  (tile-num (fetcher-tile-number fetcher))
-                  (fine-y (mod (+ scanline (ppu-scy ppu)) 8))
-                  (tile-addr (if (= tile-base #x8800)
-                                 (+ tile-base (* (if (> tile-num 127)
-                                                     (- tile-num 256)
-                                                     tile-num)
-                                                 16))
-                                 (+ tile-base (* tile-num 16))))
-                  (data-addr (+ tile-addr (* fine-y 2) 1)))
-             (setf (fetcher-tile-data-high fetcher)
-                   (read-memory mmu data-addr))
-             (setf (fetcher-state fetcher) :push-to-fifo)))
-          
-          (:push-to-fifo
-           ;; Push pixels to FIFO if it has space
-           (when (< (fifo-size (ppu-bg-fifo ppu)) 8)
-             (let ((low (fetcher-tile-data-low fetcher))
-                   (high (fetcher-tile-data-high fetcher)))
-               ;; Push 8 pixels to FIFO
-               (dotimes (i 8)
-                 (let* ((bit (- 7 i))
-                        (color-low (logand (ash low (- bit)) 1))
-                        (color-high (ash (logand (ash high (- bit)) 1) 1))
-                        (color-num (logior color-high color-low)))
-                   (fifo-push (ppu-bg-fifo ppu)
-                              (get-color (ppu-bgp ppu) color-num))))
-               ;; Move to next tile
-               (incf (fetcher-x fetcher) 8)
-               (setf (fetcher-state fetcher) :get-tile)))))
-        
-        ;; Output pixel if we have one in the FIFO
-        (when (and (>= x 0) (< x +screen-width+))
-          (let ((color (fifo-pop (ppu-bg-fifo ppu))))
-            (when color
-              (set-pixel ppu x scanline color))))))
-    
-    ;; Update STAT register
-    (update-stat-register ppu mmu)))
+      (:pixel-transfer
+       (let ((fetcher (ppu-fetcher ppu)))
+         (case (fetcher-state fetcher)
+           (:get-tile
+            (setf (fetcher-tile-number fetcher) 
+                  (get-tile-number ppu mmu scanline fetcher)) 
+            (setf (fetcher-state fetcher) :get-tile-data-low))
+
+           (:get-tile-data-low
+            (multiple-value-bind (low high)
+                (fetch-tile-data ppu mmu scanline (fetcher-tile-number fetcher))
+              (setf (fetcher-tile-data-low fetcher) low
+                    (fetcher-tile-data-high fetcher) high
+                    (fetcher-state fetcher) :push-and-draw)))
+
+           (:push-and-draw; Combined push and draw
+            (loop for i from 0 below 8 do; Process and draw all 8 pixels of the tile row
+                  (let* ((bit (- 7 i))
+                         (color-low (logand (ash (fetcher-tile-data-low fetcher) (- bit)) 1))
+                         (color-high (ash (logand (ash (fetcher-tile-data-high fetcher) (- bit)) 1) 1))
+                         (color-num (logior color-high color-low)))
+                    (let ((pixel (make-pixel :x (fetcher-x fetcher)
+                                             :colour (get-color (ppu-bgp ppu) color-num))))
+                      (when (and (>= (pixel-x pixel) 0) (< (pixel-x pixel) +screen-width+))
+                        (set-pixel ppu (pixel-x pixel) scanline (pixel-colour pixel)))
+                      (incf (fetcher-x fetcher)))))
+            (setf (fetcher-state fetcher) :get-tile)
+            (when (<= 160 (fetcher-x fetcher)); Check screen width
+              (setf (fetcher-x fetcher) 0)
+              (setf (ppu-phase ppu) :h-blank))
+            (when (= scanline 144)
+              (setf (ppu-phase ppu) :v-blank))))))
+         (:h-blank
+          (when (>= ppu-cycle +hblank-cycles+)
+            (setf (mmu-oam-lock mmu) nil)
+            (setf (mmu-vram-lock mmu) nil)
+            (setf (ppu-phase ppu) :oam-search)))   
+         (:v-blank
+          (when (>= ppu-cycle +vblank-cycles+) ; Use ppu-cycle for timing
+            (request-vblank-interrupt mmu)
+            (setf (ppu-phase ppu) :oam-search)))))
+    (update-stat-register ppu mmu)) 

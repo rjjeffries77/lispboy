@@ -1,4 +1,5 @@
 (in-package :lispboy)
+(declaim (optimize (speed 3) (safety 0)))
 
 (defstruct mmu
   (rom (make-array #x8000 :element-type '(unsigned-byte 8)))  ; 32KB ROM space
@@ -9,6 +10,8 @@
   (hram (make-array #x7F :element-type '(unsigned-byte 8)))   ; High RAM
   (if 0 :type (unsigned-byte 8))
   (ie 0 :type (unsigned-byte 8))
+  (oam-lock nil :type boolean)
+  (vram-lock nil :type boolean)
   (interrupt-lock (bt:make-lock "interrupt-flag-lock")))
 
 (defun read-memory (mmu address)
@@ -21,6 +24,7 @@
     ;; VRAM ($8000-$9FFF)
     ((< address #xA000)
      (aref (mmu-vram mmu) (- address #x8000)))
+
     
     ;; Work RAM ($C000-$DFFF)
     ((< address #xE000)
@@ -28,7 +32,8 @@
     
     ;; Echo RAM ($E000-$FDFF) - mirrors $C000-$DDFF
     ((< address #xFE00)
-     (aref (mmu-wram mmu) (- address #xE000)))
+     (aref (mmu-wram mmu) (-
+                           address #xE000)))
     
     ;; OAM ($FE00-$FE9F)
     ((< address #xFEA0)
@@ -76,7 +81,9 @@
     
     ;; OAM ($FE00-$FE9F)
     ((< address #xFEA0)
-     (setf (aref (mmu-oam mmu) (- address #xFE00)) value))
+     (if (not (mmu-oam-lock mmu))
+         (setf (aref (mmu-oam mmu) (- address #xFE00)) value)))
+    
     
     ;; I/O Registers ($FF00-$FF7F)
     ((< address #xFF80)
