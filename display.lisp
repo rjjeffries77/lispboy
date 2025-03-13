@@ -1,4 +1,3 @@
-
 (in-package :lispboy)
 (declaim (optimize (speed 3) (safety 0)))
 
@@ -37,14 +36,19 @@
 
 ;; PPU timing constants
 (defconstant +vblank-start+ 144)    ; First VBlank line
-(defconstant +vblank-end+ 153)  
-(defconstant +oam-search-cycles+ 80)    ; OAM search - 80 cycles
-(defconstant +hblank-cycles+ 43)   ; Pixel transfer - 172-289 cycles
-(defconstant +vblank-cycles+ 1140)   ; H-Blank - 87-204 cycles
+(defconstant +vblank-end+ 153)      ; Last VBlank line
+(defconstant +mode-2-cycles+ 80)    ; OAM search - 80 cycles
+(defconstant +mode-3-cycles+ 172)   ; Pixel transfer - 172 cycles (minimum)
+(defconstant +mode-0-cycles+ 204)   ; H-Blank - 204 cycles (maximum)
 (defconstant +scanline-cycles+ 456) ; Total cycles per scanline
-(defconstant +vblank-scanlines+ 10) ; Number of V-Blank scanlines
+(defconstant +frame-cycles+ 70224)  ; Total cycles per frame
 
-;; STAT register bit masks
+;; PPU modes
+(defconstant +mode-hblank+ 0)      ; H-Blank period
+(defconstant +mode-vblank+ 1)      ; V-Blank period
+(defconstant +mode-oam+ 2)         ; OAM search period
+(defconstant +mode-transfer+ 3)    ; Pixel transfer period
+
 (defconstant +stat-mode-flag+ #x03)      ; Current PPU mode
 (defconstant +stat-coincidence+ #x04)    ; LYC=LY coincidence flag
 (defconstant +stat-mode-0-int+ #x08)     ; Mode 0 H-Blank interrupt
@@ -89,6 +93,7 @@
   (bg-fifo (make-fifo))
   (sprite-fifo (make-fifo))
   (fetcher (make-fetcher))
+  (sprites nil :type list)           ; List of visible sprites for current scanline
   (phase :h-blank)
   (framebuffer (cffi:null-pointer) :type cffi:foreign-pointer))
 
@@ -293,7 +298,7 @@
          ;; Reset window line counter at start of frame
        (when (zerop scanline)
          (setf (ppu-window-line ppu) 0))
-       (when (>= ppu-cycle +oam-search-cycles+); Use ppu-cycle for timing
+       (when (>= ppu-cycle +mode-2-cycles+); Use ppu-cycle for timing
          (setf (ppu-phase ppu) :pixel-transfer)))
 
       (:pixel-transfer
@@ -329,12 +334,249 @@
             (when (= scanline 144)
               (setf (ppu-phase ppu) :v-blank))))))
          (:h-blank
-          (when (>= ppu-cycle +hblank-cycles+)
+          (when (>= ppu-cycle +mode-0-cycles+)
             (setf (mmu-oam-lock mmu) nil)
             (setf (mmu-vram-lock mmu) nil)
             (setf (ppu-phase ppu) :oam-search)))   
          (:v-blank
-          (when (>= ppu-cycle +vblank-cycles+) ; Use ppu-cycle for timing
+          (when (>= ppu-cycle +mode-3-cycles+) ; Use ppu-cycle for timing
             (request-vblank-interrupt mmu)
             (setf (ppu-phase ppu) :oam-search)))))
     (update-stat-register ppu mmu)) 
+
+(defun update-ppu-mode (ppu mmu scanline dot)
+  "Update PPU mode based on current scanline and dot"
+  (let ((old-mode (ppu-mode ppu))
+        (new-mode nil))
+    
+    ;; Determine the new mode based on scanline and dot position
+    (cond
+      ;; V-Blank period (lines 144-153)
+      ((>= scanline +vblank-start+)
+       (setf new-mode +mode-vblank+)
+       (when (and (= scanline +vblank-start+) (= dot 0))
+         (request-vblank-interrupt mmu)))
+      
+      ;; Within visible scanline (0-143)
+      (t (cond
+           ;; First 80 dots: OAM Search (Mode 2)
+           ((< dot +mode-2-cycles+)
+            (setf new-mode +mode-oam+))
+           
+           ;; Next 172-289 dots: Pixel Transfer (Mode 3)
+           ((< dot (+ +mode-2-cycles+ +mode-3-cycles+))
+            (setf new-mode +mode-transfer+))
+           
+           ;; Remaining dots: H-Blank (Mode 0)
+           (t (setf new-mode +mode-hblank+)))))
+    
+    ;; Update mode if changed
+    (when (not (eql old-mode new-mode))
+      (setf (ppu-mode ppu) new-mode)
+      
+      ;; Handle mode-specific actions
+      (case new-mode
+        (#.+mode-hblank+
+         (when (lcdc-display-enabled-p ppu)
+           (render-scanline ppu mmu scanline)))
+        
+        (#.+mode-vblank+
+         (when (and (= scanline +vblank-start+) (= dot 0))
+           (render-frame ppu)))
+        
+        (#.+mode-oam+
+         (when (= dot 0)
+           (prepare-sprites ppu mmu scanline)))
+        
+        (#.+mode-transfer+
+         (block-vram-access mmu t)))  ; Block VRAM access during pixel transfer
+      
+      ;; Update STAT register and check for interrupts
+      (update-stat-register ppu mmu))))
+
+(defun prepare-sprites (ppu mmu scanline)
+  "Prepare sprites for the current scanline during OAM search"
+  (let ((sprite-height (if (lcdc-flag-set-p ppu +lcdc-obj-size+) 16 8))
+        (visible-sprites '()))
+    
+    ;; Search OAM for visible sprites on this scanline
+    (loop for sprite-index from 0 below 40
+          for oam-base = (+ #xFE00 (* sprite-index 4))
+          for sprite-y = (- (read-memory mmu oam-base) 16)
+          for sprite-x = (- (read-memory mmu (+ oam-base 1)) 8)
+          for tile-num = (read-memory mmu (+ oam-base 2))
+          for attributes = (read-memory mmu (+ oam-base 3))
+          
+          ;; Check if sprite is visible on this scanline
+          when (and (>= sprite-x -7)  ; At least partially visible horizontally
+                   (< sprite-x +screen-width+)
+                   (>= scanline sprite-y)
+                   (< scanline (+ sprite-y sprite-height)))
+          
+          ;; Collect visible sprite data
+          collect (make-sprite :x sprite-x
+                             :y sprite-y
+                             :tile-num tile-num
+                             :attributes attributes)
+          into found-sprites
+          
+          ;; Game Boy can only display 10 sprites per scanline
+          when (>= (length found-sprites) 10)
+          do (return found-sprites)
+          
+          finally (setf visible-sprites found-sprites))
+    
+    ;; Sort sprites by x-coordinate (higher x-coord gets priority)
+    (setf visible-sprites 
+          (sort visible-sprites #'> :key #'sprite-x))
+    
+    ;; Store sprites for use during pixel transfer
+    (setf (ppu-sprites ppu) visible-sprites)))
+
+(defun block-vram-access (mmu blocked)
+  "Block or unblock VRAM access during pixel transfer"
+  (setf (mmu-vram-blocked mmu) blocked))
+
+(defun render-scanline (ppu mmu scanline)
+  "Render a single scanline of the screen"
+  (when (lcdc-display-enabled-p ppu)
+    (let ((bg-enabled (lcdc-flag-set-p ppu +lcdc-bg-enable+))
+          (window-enabled (and (lcdc-flag-set-p ppu +lcdc-window-enable+)
+                             (>= scanline (ppu-wy ppu))))
+      
+      ;; Clear FIFOs
+      (fifo-clear (ppu-bg-fifo ppu))
+      (fifo-clear (ppu-sprite-fifo ppu))
+      
+      ;; Reset fetcher state
+      (setf (fetcher-state (ppu-fetcher ppu)) :get-tile
+            (fetcher-x (ppu-fetcher ppu)) 0
+            (fetcher-pushed (ppu-fetcher ppu)) 0)
+      
+      ;; Render background and window
+      (loop with x = 0
+            while (< x +screen-width+)
+            do
+            ;; Fill background FIFO
+            (when (< (fifo-size (ppu-bg-fifo ppu)) 8)
+              (fetch-background-tile ppu mmu scanline))
+            
+            ;; Check if we should switch to window
+            (when (and window-enabled 
+                      (>= x (- (ppu-wx ppu) 7))
+                      (not (eq (fetcher-state (ppu-fetcher ppu)) :window)))
+              (fifo-clear (ppu-bg-fifo ppu))
+              (setf (fetcher-state (ppu-fetcher ppu)) :window
+                    (fetcher-x (ppu-fetcher ppu)) 0))
+            
+            ;; Mix sprites with background
+            (when (lcdc-flag-set-p ppu +lcdc-obj-enable+)
+              (mix-sprites ppu mmu scanline x))
+            
+            ;; Output pixel
+            (when (> (fifo-size (ppu-bg-fifo ppu)) 0)
+              (let* ((bg-pixel (fifo-pop (ppu-bg-fifo ppu)))
+                     (sprite-pixel (fifo-pop (ppu-sprite-fifo ppu)))
+                     (final-color (mix-pixels bg-pixel sprite-pixel bg-enabled)))
+                (set-pixel ppu x scanline final-color)
+                (incf x))))
+      
+      ;; Increment window line counter if window was rendered
+      (when window-enabled
+        (incf (ppu-window-line ppu))))))
+
+(defun fetch-background-tile (ppu mmu scanline)
+  "Fetch and decode background or window tile data"
+  (let* ((fetcher (ppu-fetcher ppu))
+         (window-mode (eq (fetcher-state fetcher) :window))
+         (tile-y (if window-mode
+                    (floor (ppu-window-line ppu) 8)
+                    (floor (+ scanline (ppu-scy ppu)) 8)))
+         (tile-x (if window-mode
+                    (floor (fetcher-x fetcher) 8)
+                    (floor (+ (fetcher-x fetcher) (ppu-scx ppu)) 8)))
+         (map-base (if window-mode
+                      (if (lcdc-flag-set-p ppu +lcdc-window-tile-map+)
+                          #x9C00 #x9800)
+                      (if (lcdc-flag-set-p ppu +lcdc-bg-tile-map+)
+                          #x9C00 #x9800)))
+         (map-addr (+ map-base 
+                     (mod (* 32 tile-y) #x400) 
+                     (mod tile-x 32)))
+         (tile-num (read-memory mmu map-addr))
+         (tile-addr (get-tile-data-address ppu tile-num))
+         (line-in-tile (mod (if window-mode
+                               (ppu-window-line ppu)
+                               (+ scanline (ppu-scy ppu)))
+                           8))
+         (data-addr (+ tile-addr (* line-in-tile 2))))
+    
+    ;; Read tile data
+    (let ((data-low (read-memory mmu data-addr))
+          (data-high (read-memory mmu (1+ data-addr))))
+      
+      ;; Push 8 pixels to FIFO
+      (loop for bit from 7 downto 0
+            for color-num = (logior (ash (logand (ash data-high (- bit)) 1) 1)
+                                  (logand (ash data-low (- bit)) 1))
+            do (fifo-push (ppu-bg-fifo ppu)
+                         (get-color (ppu-bgp ppu) color-num)))
+      
+      ;; Update fetcher state
+      (incf (fetcher-x fetcher) 8))))
+
+(defun mix-sprites (ppu mmu scanline x)
+  "Mix sprite pixels with background for current x position"
+  (loop for sprite in (ppu-sprites ppu)
+        when (and (>= x (sprite-x sprite))
+                  (< x (+ (sprite-x sprite) 8)))
+        do
+        (let* ((sprite-x-flip (not (zerop (logand (sprite-attributes sprite)
+                                                 +sprite-x-flip+))))
+               (sprite-y-flip (not (zerop (logand (sprite-attributes sprite)
+                                                 +sprite-y-flip+))))
+               (behind-bg (not (zerop (logand (sprite-attributes sprite)
+                                            +sprite-priority+))))
+               (use-obp1 (not (zerop (logand (sprite-attributes sprite)
+                                           +sprite-palette+))))
+               (palette (if use-obp1 (ppu-obp1 ppu) (ppu-obp0 ppu)))
+               (sprite-line (- scanline (sprite-y sprite)))
+               (flipped-y (if sprite-y-flip
+                             (- 7 sprite-line)
+                             sprite-line))
+               (tile-addr (+ #x8000 (* (sprite-tile-num sprite) 16) 
+                            (* flipped-y 2)))
+               (data-low (read-memory mmu tile-addr))
+               (data-high (read-memory mmu (1+ tile-addr)))
+               (pixel-x (- x (sprite-x sprite)))
+               (flipped-x (if sprite-x-flip
+                             (- 7 pixel-x)
+                             pixel-x))
+               (color-num (logior (ash (logand (ash data-high (- flipped-x)) 1) 1)
+                                (logand (ash data-low (- flipped-x)) 1))))
+          
+          ;; Only push non-transparent pixels
+          (unless (zerop color-num)
+            (fifo-push (ppu-sprite-fifo ppu)
+                      (cons (get-color palette color-num) behind-bg))))))
+
+(defun mix-pixels (bg-pixel sprite-pixel bg-enabled)
+  "Mix background and sprite pixels according to priority rules"
+  (cond
+    ;; No sprite pixel
+    ((null sprite-pixel) bg-pixel)
+    
+    ;; Background disabled
+    ((not bg-enabled) (car sprite-pixel))
+    
+    ;; Sprite behind background and background pixel is not transparent
+    ((and (cdr sprite-pixel) (not (= bg-pixel (aref +color-map+ 0))))
+     bg-pixel)
+    
+    ;; Use sprite pixel
+    (t (car sprite-pixel))))
+
+(defun render-frame (ppu)
+  "Render the entire screen"
+  ;; Implementation of render-frame function
+  )
